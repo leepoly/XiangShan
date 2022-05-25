@@ -176,6 +176,27 @@ class MinimalConfig(n: Int = 1) extends Config(
   })
 )
 
+class HybridMemConfig(n: Int = 1) extends Config(
+  new MinimalConfig(n).alter((site, here, up) => {
+    case DebugOptionsKey => up(DebugOptionsKey).copy(
+      EnablePerfDebug = true
+    )
+    case SoCParamsKey => up(SoCParamsKey).copy(
+      L3CacheParamsOpt = Some(up(SoCParamsKey).L3CacheParamsOpt.get.copy(
+        sets = 1024,
+        simulation = true
+      )),
+      L3NBanks = 1,
+      L4CacheParamsOpt = Some(up(SoCParamsKey).L4CacheParamsOpt.get.copy(
+        sets = 2048,
+        simulation = true,
+        enablePerf = true,
+      )),
+      L4NBanks = 1
+    )
+  })
+)
+
 // Non-synthesizable MinimalConfig, for fast simulation only
 class MinimalSimConfig(n: Int = 1) extends Config(
   new MinimalConfig(n).alter((site, here, up) => {

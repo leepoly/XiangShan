@@ -51,6 +51,7 @@ case class SoCParameters
   L4CacheParamsOpt: Option[HCCacheParameters] = Some(HCCacheParameters(
     name = "l4",
     level = 4,
+    // inclusive = false, // flat mode. Enable LogAccumulator
     ways = 16,
     sets = 4096
   ))
@@ -245,12 +246,14 @@ class SoCMisc()(implicit p: Parameters) extends BaseSoC
 
   val l3_in = TLTempNode()
   val l3_out = TLTempNode()
+  val l3_mem_pmu = BusPerfMonitor(enable = !debugOpts.FPGAPlatform)
   val l4_in = TLTempNode()
   val l4_out = TLTempNode()
+  val l4_mem_pmu = BusPerfMonitor(enable = !debugOpts.FPGAPlatform)
 
   l3_in :*= TLEdgeBuffer(_ => true, Some("L3_in_buffer")) :*= l3_banked_xbar
-  l3_bankedNode :*= TLLogger("L4_L3", !debugOpts.FPGAPlatform) :*= l3_out
-  l4_bankedNode :*= TLLogger("MEM_L4", !debugOpts.FPGAPlatform) :*= l4_out
+  l3_bankedNode :*= TLLogger("L4_L3", !debugOpts.FPGAPlatform) :*= l3_mem_pmu :*= l3_out
+  l4_bankedNode :*= TLLogger("MEM_L4", !debugOpts.FPGAPlatform) :*= l4_mem_pmu :*= l4_out
 
   if(soc.L3CacheParamsOpt.isEmpty){
     l3_out :*= l3_in
