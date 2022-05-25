@@ -72,6 +72,12 @@ class XSTop()(implicit p: Parameters) extends BaseXSSoc() with HasSoCParameter
     })))
   )
 
+  val l4cacheOpt = soc.L4CacheParamsOpt.map(l4param =>
+    LazyModule(new HuanCun()(new Config((_, _, _) => {
+      case HCCacheParamsKey => l4param
+    })))
+  )
+
   for (i <- 0 until NumCores) {
     core_with_l2(i).clint_int_sink := misc.clint.intnode
     core_with_l2(i).plic_int_sink :*= misc.plic.intnode
@@ -99,6 +105,12 @@ class XSTop()(implicit p: Parameters) extends BaseXSSoc() with HasSoCParameter
   l3cacheOpt match {
     case Some(l3) =>
       misc.l3_out :*= l3.node :*= TLBuffer.chainNode(2) :*= misc.l3_banked_xbar
+    case None =>
+  }
+
+  l4cacheOpt match {
+    case Some(l4) =>
+      misc.l4_out :*= l4.node :*= TLBuffer.chainNode(2) :*= misc.l3_bankedNode
     case None =>
   }
 

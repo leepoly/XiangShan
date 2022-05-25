@@ -166,7 +166,12 @@ class MinimalConfig(n: Int = 1) extends Config(
         sets = 1024,
         simulation = true
       )),
-      L3NBanks = 1
+      L3NBanks = 1,
+      L4CacheParamsOpt = Some(up(SoCParamsKey).L4CacheParamsOpt.get.copy(
+        sets = 2048,
+        simulation = true
+      )),
+      L4NBanks = 1
     )
   })
 )
