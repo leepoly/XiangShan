@@ -179,7 +179,7 @@ class MinimalConfig(n: Int = 1) extends Config(
 class HybridMemConfig(n: Int = 1) extends Config(
   new MinimalConfig(n).alter((site, here, up) => {
     case DebugOptionsKey => up(DebugOptionsKey).copy(
-      EnablePerfDebug = true
+      EnableL4PerfDebug = true
     )
     case SoCParamsKey => up(SoCParamsKey).copy(
       L3CacheParamsOpt = Some(up(SoCParamsKey).L3CacheParamsOpt.get.copy(

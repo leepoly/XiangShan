@@ -52,8 +52,9 @@ case class SoCParameters
     name = "l4",
     level = 4,
     // inclusive = false, // flat mode. Enable LogAccumulator
+    blockBytes = 64,
     ways = 16,
-    sets = 4096
+    sets = 16384
   ))
 ){
   // L3 configurations

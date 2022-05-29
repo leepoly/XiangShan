@@ -95,6 +95,11 @@ class SimTop(implicit p: Parameters) extends Module {
     ExcitingUtils.addSource(dump, "XSPERF_DUMP")
   }
 
+  if (!debugOpts.FPGAPlatform && debugOpts.EnableL4PerfDebug) {
+    val l4dump = io.perfInfo.dump
+    ExcitingUtils.addSource(l4dump, "XSL4PERF_DUMP")
+  }
+
   // Check and dispaly all source and sink connections
   ExcitingUtils.fixConnections()
   ExcitingUtils.checkAndDisplay()
