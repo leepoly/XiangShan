@@ -1,28 +1,24 @@
 package l4cache
 
-import chipsalliance.rocketchip.config.{Field, Parameters}
-// import freechips.rocketchip.config.{Field, Parameters}
-import utils.GTimer
 import chisel3._
 import chisel3.util._
-// import chisel3.util.IrrevocableIO
+import freechips.rocketchip.config.{Field, Parameters}
 import freechips.rocketchip.diplomacy._
-import freechips.rocketchip.tilelink._
-// import freechips.rocketchip.util.{BundleField, BundleFieldBase, UIntToOH1}
 import freechips.rocketchip.util._
+import freechips.rocketchip.tilelink._
 import scala.math._
+import utils.GTimer
 
 case object NL4CacheCapacity extends Field[Int](2048)
 case object NL4CacheWays extends Field[Int](16)
-case object NBanksPerMemChannel extends Field[Int](4)
-
-case class TLL4CacheParams(
-  debug: Boolean = false
-)
+case object NL4BanksPerMemChannel extends Field[Int](4)
 
 trait HasL4CacheParameters {
   implicit val p: Parameters
-  val nL2Banks = p(NBanksPerMemChannel)
+  val nL4Banks = p(NL4BanksPerMemChannel)
+  val nWays = p(NL4CacheWays)
+  val nSets = p(NL4CacheCapacity) * 1024 / 64 / nWays
+  val blockSize = 64 * 8
   val cacheCapacityWidth = log2Ceil(p(NL4CacheCapacity) * 1024 / 64)
 }
 
@@ -35,7 +31,7 @@ class MetadataEntry(tagBits: Int) extends Bundle {
 }
 
 // ============================== DCache ==============================
-class TLSimpleL4Cache(param: TLL4CacheParams)(implicit p: Parameters) extends LazyModule
+class TLSimpleL4Cache()(implicit p: Parameters) extends LazyModule
 with HasL4CacheParameters
 {
   val node = TLAdapterNode(
@@ -43,19 +39,18 @@ with HasL4CacheParameters
   )
 
   lazy val module = new LazyModuleImp(this) {
-    val nWays = p(NL4CacheWays)
     println(s"nWays = $nWays")
-    val nSets = p(NL4CacheCapacity) * 1024 / 64 / nWays
     println(s"nSets = $nSets")
 
     (node.in zip node.out) foreach { case ((in, edgeIn), (out, edgeOut)) =>
       require(isPow2(nSets))
       require(isPow2(nWays))
+
       /* parameters */
       val Y = true.B
       val N = false.B
+      val debug = true
 
-      val blockSize = 64 * 8
       val blockBytes = blockSize / 8
       val innerBeatSize = in.d.bits.params.dataBits
       val innerBeatBytes = innerBeatSize / 8
@@ -111,7 +106,7 @@ with HasL4CacheParameters
       val timer = GTimer()
       val log_prefix = "cycle: %d [L4Cache] state %x "
       def log_raw(prefix: String, fmt: String, tail: String, args: Bits*) = {
-        if (param.debug) {
+        if (debug) {
           printf(prefix + fmt + tail, args:_*)
         }
       }
@@ -133,6 +128,25 @@ with HasL4CacheParameters
           in.a.bits.mask,
           in.a.bits.data)
       }
+
+      // when (in.a.valid) {
+      //   log("[DEBUG] in.a opcode %x, size %x, address %x, param %x, data %x, ready %x, valid %x",
+      //     in.a.bits.opcode,
+      //     in.a.bits.size,
+      //     in.a.bits.address,
+      //     in.a.bits.param,
+      //     in.a.bits.data,
+      //     in.a.ready,
+      //     in.a.valid)
+      // }
+      // when (in.d.valid) {
+      //   log("[DEBUG] in.d opcode %x, param %x, data %x, ready %x, valid %x",
+      //     in.d.bits.opcode,
+      //     in.d.bits.param,
+      //     in.d.bits.data,
+      //     in.d.ready,
+      //     in.d.valid)
+      // }
 
       when (out.a.fire()) {
         log("out.a.opcode %x, param %x, size %x, source %x, address %x, mask %x, data %x",
@@ -227,7 +241,7 @@ with HasL4CacheParameters
       // s_gather_write_data:
       // gather write data
       val put_data_buf = Reg(Vec(outerDataBeats, UInt(outerBeatSize.W)))
-      val put_data_mask = RegInit(VecInit(Seq.fill(outerDataBeats)(0.U(outerBeatBytes))))
+      val put_data_mask = RegInit(VecInit(Seq.fill(outerDataBeats) { 0.U(outerBeatBytes.W) }))
       val wdata_recv_ready = state === s_gather_write_data
       // when (state === s_gather_write_data && in_write_req) {
       // tilelink receives the first data beat when address handshake
@@ -317,7 +331,8 @@ with HasL4CacheParameters
       val write_hit = hit && wen
       val read_miss = !hit && ren
       val write_miss = !hit && wen
-      val hit_way = 0.U(log2Ceil(nWays).W)
+      val hit_way = Wire(Bits())
+      hit_way := 0.U
       (0 until nWays).foreach(i => when (tag_match_way(i)) { hit_way := i.U })
 
       val curr_mask = 0xffff.U
@@ -381,12 +396,13 @@ with HasL4CacheParameters
 
       val update_way = Mux(hit, hit_way, repl_way)
       val next_state = Wire(Bits())
+      next_state := 0.U
       when (state === s_tag_read) {
         when (!(curr_state_reg & curr_mask).orR) {
           next_state := curr_state_reg | curr_mask
         } .otherwise {
           val new_mask = ~(1.U << update_way)
-          next_state := next_state & new_mask
+          next_state := curr_state_reg & new_mask
           // next_state := curr_state_reg.bitSet(update_way, false.B)
         }
         log("set: %d hit: %d rw: %d update_way: %d curr_state: %x next_state: %x",
@@ -447,7 +463,7 @@ with HasL4CacheParameters
       for (((data_array, omSRAM), i) <- data_arrays zipWithIndex) {
         when (data_write_valid) {
           log("write data array: %d idx: %d way: %d data: %x", i.U, data_write_idx, data_write_way, din(i))
-          data_array.write(data_write_idx, VecInit(Seq.fill(nWays)(din(i))), (0 until nWays).map(data_write_way === _.U))
+          data_array.write(data_write_idx, VecInit(Seq.fill(nWays) { din(i) }), (0 until nWays).map(data_write_way === _.U))
         }
         dout(i) := data_array.read(data_read_idx, data_read_valid && !data_write_valid)(data_read_way)
         when (RegNext(data_read_valid, N)) {
@@ -583,7 +599,7 @@ with HasL4CacheParameters
       out.a.bits.address := out_addr
       out.a.bits.mask    := edgeOut.mask(out_addr, outerBurstLen.U)
       out.a.bits.data    := out_data
-      out.a.bits.corrupt := false.B
+      out.a.bits.corrupt := N
       // edgeOut.Put(0.asUInt(outerIdWidth.W), out_addr, outerBeatLen.U, out_data)
 
       out.a.valid := out_write_valid || out_read_valid
@@ -614,22 +630,30 @@ with HasL4CacheParameters
       in.d.bits.size    := size_reg
       in.d.bits.source  := id
       in.d.bits.sink    := 0.U
-      in.d.bits.denied  := false.B
+      in.d.bits.denied  := N
       in.d.bits.data    := resp_data(resp_curr_beat)
-      in.d.bits.corrupt := false.B
+      in.d.bits.corrupt := N
       // edgeIn.AccessAck(id, size_reg, resp_data(resp_curr_beat))
 
       if (edgeOut.manager.anySupportAcquireB && edgeOut.client.anySupportProbe) {
-        in.b <> out.b
-        out.c <> in.c
-        out.e <> in.e
+        in.b.valid := out.b.valid
+        out.b.ready := in.b.ready
+        in.b.bits := out.b.bits
+
+        out.c.valid := in.c.valid
+        in.c.ready := out.c.ready
+        out.c.bits := in.c.bits
+
+        out.e.valid := in.e.valid
+        in.e.ready := out.e.ready
+        out.e.bits := in.e.bits
       } else {
-        in.b.valid := false.B
-        in.c.ready := true.B
-        in.e.ready := true.B
-        out.b.ready := true.B
-        out.c.valid := false.B
-        out.e.valid := false.B
+        in.b.valid := N
+        in.c.ready := Y
+        in.e.ready := Y
+        out.b.ready := Y
+        out.c.valid := N
+        out.e.valid := N
       }
     }
   }
@@ -640,7 +664,7 @@ object TLSimpleL4Cache
   def apply()(implicit p: Parameters): TLNode =
   {
     if (p(NL4CacheCapacity) != 0) {
-      val tlsimpleL4cache = LazyModule(new TLSimpleL4Cache(TLL4CacheParams()))
+      val tlsimpleL4cache = LazyModule(new TLSimpleL4Cache())
       tlsimpleL4cache.node
     }
     else {
@@ -653,7 +677,7 @@ object TLSimpleL4Cache
 object TLSimpleL4CacheRef
 {
   def apply()(implicit p: Parameters): TLSimpleL4Cache = {
-    val tlsimpleL4cache = LazyModule(new TLSimpleL4Cache(TLL4CacheParams()))
+    val tlsimpleL4cache = LazyModule(new TLSimpleL4Cache())
     tlsimpleL4cache
   }
 }
