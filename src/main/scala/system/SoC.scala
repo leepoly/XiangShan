@@ -32,6 +32,7 @@ import top.BusPerfMonitor
 import xiangshan.backend.fu.PMAConst
 import huancun._
 import huancun.debug.TLLogger
+import l4cache._
 
 case object SoCParamsKey extends Field[SoCParameters]
 
@@ -46,22 +47,11 @@ case class SoCParameters
     level = 3,
     ways = 8,
     sets = 2048 // 1MB per bank
-  )),
-  L4NBanks: Int = 1,
-  L4CacheParamsOpt: Option[HCCacheParameters] = Some(HCCacheParameters(
-    name = "l4",
-    level = 4,
-    // inclusive = false, // flat mode. Enable LogAccumulator
-    blockBytes = 64,
-    ways = 16,
-    sets = 16384
   ))
 ){
   // L3 configurations
   val L3InnerBusWidth = 256
   val L3BlockSize = 64
-  // L4 configurations
-  val L4BlockSize = 64
   // on chip network configurations
   val L3OuterBusWidth = 256
 }
@@ -84,9 +74,6 @@ trait HasSoCParameter {
   // on chip network configurations
   val L3OuterBusWidth = soc.L3OuterBusWidth
 
-  // L4 configurations
-  val L4NBanks = soc.L4NBanks
-  val L4BlockSize = soc.L4BlockSize
   val NrExtIntr = soc.extIntrs
 }
 
@@ -95,7 +82,6 @@ class ILABundle extends Bundle {}
 
 abstract class BaseSoC()(implicit p: Parameters) extends LazyModule with HasSoCParameter {
   val l3_bankedNode = BankBinder(L3NBanks, L3BlockSize)
-  val l4_bankedNode = BankBinder(L4NBanks, L4BlockSize)
   val peripheralXbar = TLXbar()
   val l3_xbar = TLXbar()
   val l3_banked_xbar = TLXbar()
@@ -167,7 +153,7 @@ trait HaveAXI4MemPort {
     TLXbar() :=*
     TLBuffer.chainNode(2) :=*
     TLCacheCork() :=*
-    l4_bankedNode
+    l3_bankedNode
 
   mem_xbar :=
     TLWidthWidget(8) :=
@@ -175,6 +161,7 @@ trait HaveAXI4MemPort {
     peripheralXbar
 
   memAXI4SlaveNode :=
+    AXI4SimpleL4Cache() := // Insert AXI-based L4 cache
     AXI4Buffer() :=
     AXI4Buffer() :=
     AXI4Buffer() :=
@@ -248,20 +235,12 @@ class SoCMisc()(implicit p: Parameters) extends BaseSoC
   val l3_in = TLTempNode()
   val l3_out = TLTempNode()
   val l3_mem_pmu = BusPerfMonitor(enable = !debugOpts.FPGAPlatform)
-  val l4_in = TLTempNode()
-  val l4_out = TLTempNode()
-  val l4_mem_pmu = BusPerfMonitor(enable = !debugOpts.FPGAPlatform)
 
   l3_in :*= TLEdgeBuffer(_ => true, Some("L3_in_buffer")) :*= l3_banked_xbar
-  l3_bankedNode :*= TLLogger("L4_L3", !debugOpts.FPGAPlatform) :*= l3_mem_pmu :*= l3_out
-  l4_bankedNode :*= TLLogger("MEM_L4", !debugOpts.FPGAPlatform) :*= l4_mem_pmu :*= l4_out
+  l3_bankedNode :*= TLLogger("MEM_L3", !debugOpts.FPGAPlatform) :*= l3_mem_pmu :*= l3_out
 
   if(soc.L3CacheParamsOpt.isEmpty){
     l3_out :*= l3_in
-  }
-
-  if(soc.L4CacheParamsOpt.isEmpty){
-    l4_out :*= l4_in
   }
 
   for(port <- peripheral_ports) {

@@ -29,7 +29,6 @@ import freechips.rocketchip.tilelink._
 import freechips.rocketchip.jtag.JTAGIO
 import freechips.rocketchip.util.{ElaborationArtefacts, HasRocketChipStageUtils, UIntToOH1}
 import huancun.{HCCacheParamsKey, HuanCun}
-import l4cache._
 
 abstract class BaseXSSoc()(implicit p: Parameters) extends LazyModule
   with BindingScope
@@ -73,13 +72,6 @@ class XSTop()(implicit p: Parameters) extends BaseXSSoc() with HasSoCParameter
     })))
   )
 
-  val l4 = LazyModule(new HuanCun())
-  // val l4cacheOpt = soc.L4CacheParamsOpt.map(l4param =>
-  //   LazyModule(new HuanCun()(new Config((_, _, _) => {
-  //     case HCCacheParamsKey => l4param
-  //   })))
-  // )
-
   for (i <- 0 until NumCores) {
     core_with_l2(i).clint_int_sink := misc.clint.intnode
     core_with_l2(i).plic_int_sink :*= misc.plic.intnode
@@ -109,8 +101,6 @@ class XSTop()(implicit p: Parameters) extends BaseXSSoc() with HasSoCParameter
       misc.l3_out :*= l3.node :*= TLBuffer.chainNode(2) :*= misc.l3_banked_xbar
     case None =>
   }
-
-  misc.l4_out :*= l4.node :*= TLBuffer.chainNode(2) :*= misc.l3_bankedNode
 
   lazy val module = new LazyRawModuleImp(this) {
     ElaborationArtefacts.add("dts", dts)
