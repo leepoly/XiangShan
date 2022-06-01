@@ -3,7 +3,7 @@ package l4cache
 import chisel3._
 import chisel3.util._
 import chisel3.util.random._
-import freechips.rocketchip.config.{Field,Parameters}
+import freechips.rocketchip.config.{Field, Parameters}
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.util._
 import freechips.rocketchip.amba.axi4._
@@ -22,6 +22,17 @@ object CheckOneHot {
     val oneHot = bitOneHot.orR
     val noneHot = value === 0.U
     assert(oneHot || noneHot)
+  }
+}
+
+object L4PerfAccumulator {
+  def apply(perfName: String, perfCnt: UInt)(implicit p: Parameters) = {
+      val counter = RegInit(0.U(64.W))
+      val next_counter = counter + perfCnt
+      counter := next_counter
+      when (GTimer() % 1000000.U === 0.U) {
+        printf(p"[l4counter] $perfName, $next_counter\n")
+      }
   }
 }
 
@@ -538,6 +549,10 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       in_r.last := resp_last_beat
       //in_r.user := 0.asUInt(5.W)
       in.r.valid := state === s_data_resp
+
+      // Stat counters
+      L4PerfAccumulator("l4_req", state === s_tag_read) // tag_read lasts one cycle per request
+      L4PerfAccumulator("l4_req_hit", state === s_tag_read && hit)
     }
   }
 }
