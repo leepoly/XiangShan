@@ -25,6 +25,14 @@ object CheckOneHot {
   }
 }
 
+// a and b must be both hot or none hot
+object bothHotOrNoneHot {
+  def apply(a: Bool, b: Bool, str: String): Unit = {
+    val cond = (a === b)
+      assert(cond, str)
+  }
+}
+
 object L4PerfAccumulator {
   def apply(perfName: String, perfCnt: UInt)(implicit p: Parameters) = {
       val counter = RegInit(0.U(64.W))
@@ -37,6 +45,12 @@ object L4PerfAccumulator {
 }
 
 // ============================== DCache ==============================
+// TODO list:
+// 1. powerful stats (show all counters [nHit, nAccess] for every 10K cycles)
+// 2. integrate tag, vb, and db into MetaEntry
+// 3. Support large block size (and validate)
+// 4. Add sub-blocking into MetaEntry.
+
 class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 {
   val node = AXI4AdapterNode()
@@ -52,11 +66,11 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       val N = false.B
       val debug = false
 
-      val blockSize = 64 * 8
-      val blockBytes = blockSize / 8
+      val blockSizeBits = 64 * 8
+      val blockBytes = blockSizeBits / 8
       val innerBeatSize = in.r.bits.params.dataBits
       val innerBeatBytes = innerBeatSize / 8
-      val innerDataBeats = blockSize / innerBeatSize
+      val innerDataBeats = blockSizeBits / innerBeatSize
       val innerBeatBits = log2Ceil(innerBeatBytes)
       val innerBeatIndexBits = log2Ceil(innerDataBeats)
       val innerBeatLSB = innerBeatBits
@@ -64,7 +78,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 
       val outerBeatSize = out.r.bits.params.dataBits
       val outerBeatBytes = outerBeatSize / 8
-      val outerDataBeats = blockSize / outerBeatSize
+      val outerDataBeats = blockSizeBits / outerBeatSize
       val addrWidth = in.ar.bits.params.addrBits
       val innerIdWidth = in.ar.bits.params.idBits
       val outerIdWidth = out.ar.bits.params.idBits
@@ -103,6 +117,20 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       //                                  -> s_merge_put_data -> s_data_write -> s_update_meta -> s_idle
       // write miss writeback : s_idle -> s_gather_write_data ->  s_send_bresp -> s_tag_read -> s_data_read -> s_wait_ram_awready -> s_do_ram_write -> s_wait_ram_bresp
       //                               -> s_wait_ram_arready -> s_do_ram_read -> s_merge_put_data -> s_data_write -> s_update_meta -> s_idle
+      val timer = GTimer()
+      val log_prefix = "cycle: %d [L4Cache] state %x "
+      def log_raw(prefix: String, fmt: String, tail: String, args: Bits*) = {
+        if (debug) {
+          printf(prefix + fmt + tail, args:_*)
+        }
+      }
+
+      /** Single log */
+      def log(fmt: String, args: Bits*) = log_raw(log_prefix, fmt, "\n", timer +: state +: args:_*)
+      /** Log with line continued */
+      def log_part(fmt: String, args: Bits*) = log_raw(log_prefix, fmt, "", timer +: state +: args:_*)
+      /** Log with nothing added */
+      def log_plain(fmt: String, args: Bits*) = log_raw("", fmt, "", args:_*)
 
       val in_ar = in.ar.bits
       val in_aw = in.aw.bits
@@ -183,7 +211,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         when (gather_last_beat) {
           state := s_send_bresp
         }
-        // bothHotOrNoneHot(gather_last_beat, in_w.last, "L2 gather beat error")
+        bothHotOrNoneHot(gather_last_beat, in_w.last, "L2 gather beat error")
       }
 
       // s_send_bresp:
@@ -263,29 +291,29 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       val need_data_read = read_hit || write_hit || read_miss_writeback || write_miss_writeback
 
       when (state === s_tag_read) {
-        if (debug) {
-          when (ren) {
-            printf("time: %d [L2] read addr: %x idx: %d tag: %x hit: %d ",
-              GTimer(), addr, idx, tag, hit)
-          }
-          when (wen) {
-            printf("time: %d [L2] write addr: %x idx: %d tag: %x hit: %d ",
-              GTimer(), addr, idx, tag, hit)
-          }
-          when (hit) {
-            printf("hit_way: %d\n", hit_way)
-          } .elsewhen (need_writeback) {
-            printf("repl_way: %d wb_addr: %x\n", repl_way, writeback_addr)
-          } .otherwise {
-            printf("repl_way: %d repl_addr: %x\n", repl_way, writeback_addr)
-          }
-          printf("time: %d [L4Cache] s1 tags: ", GTimer())
-          for (i <- 0 until nWays) {
-            printf("%x ", tag_rdata(i))
-          }
-          printf("\n")
-          printf("time: %d [L4Cache] s1 vb: %x db: %x\n", GTimer(), vb_rdata, db_rdata)
-        }
+        log("req: isread %x iswrite %x addr %x idx %d tag %x hit %d hit_way %x repl_way %x needwb %x wbaddr %x",
+            ren, wen,
+            addr,
+            idx,
+            tag,
+            hit, hit_way,
+            repl_way,
+            need_writeback, writeback_addr)
+        // printf("[L4cache] time %d req: isread %x iswrite %x addr %x idx %d tag %x hit %d hit_way %x repl_way %x needwb %x wbaddr %x\n",
+        //     GTimer(), ren, wen,
+        //     addr,
+        //     idx,
+        //     tag,
+        //     hit, hit_way,
+        //     repl_way,
+        //     need_writeback, writeback_addr)
+        // show all tags, valid and dirty bits
+        // log("time: %d [L4Cache] s1 tags: ", GTimer())
+        // for (i <- 0 until nWays) {
+        //   log("%x ", tag_rdata(i))
+        // }
+        // log("\n")
+        // log("time: %d [L4Cache] s1 vb: %x db: %x\n", GTimer(), vb_rdata, db_rdata)
 
         // check for cross cache line bursts
         assert(inner_end_beat < innerDataBeats.U, "cross cache line bursts detected")
@@ -326,18 +354,14 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       }
       for (((data_array, omSRAM), i) <- data_arrays zipWithIndex) {
         when (data_write_valid) {
-          if (debug) {
-            printf("time: %d [L2 Cache] write data array: %d idx: %d way: %d data: %x\n",
-              GTimer(), i.U, data_write_idx, data_write_way, din(i))
-          }
+          log("write data array: %d idx %d way %d data %x\n",
+            i.U, data_write_idx, data_write_way, din(i))
           data_array.write(data_write_idx, VecInit(Seq.fill(nWays) { din(i) }), (0 until nWays).map(data_write_way === _.U))
         }
         dout(i) := data_array.read(data_read_idx, data_read_valid && !data_write_valid)(data_read_way)
-        if (debug) {
-          when (RegNext(data_read_valid, N)) {
-            printf("time: %d [L2 Cache] read data array: %d idx: %d way: %d data: %x\n",
-              GTimer(), i.U, RegNext(data_read_idx), RegNext(data_read_way), dout(i))
-          }
+        when (RegNext(data_read_valid, N)) {
+          log("read data array: %d idx %d way %d data %x\n",
+            i.U, RegNext(data_read_idx), RegNext(data_read_way), dout(i))
         }
       }
 
@@ -402,10 +426,8 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       val vb_array_wdata = Mux(rst, 0.U(nWays.W), vb_rdata.bitSet(way, true.B))
 
       when (vb_array_wen) {
-        if (debug) {
-          printf("time: %d [L4Cache] write_vb_array: idx: %d data: %d\n",
-            GTimer(), vb_array_widx, vb_array_wdata)
-        }
+        log("write_vb_array: idx %d data %d\n",
+            vb_array_widx, vb_array_wdata)
         vb_array.write(vb_array_widx, vb_array_wdata)
       }
 
@@ -413,10 +435,8 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       val db_array_widx = Mux(rst, rst_cnt, idx)
       val db_array_wdata = Mux(rst, 0.U(nWays.W), db_rdata.bitSet(way, wen))
       when (db_array_wen) {
-        if (debug) {
-          printf("time: %d [L4Cache] write_db_array: idx: %d data: %d\n",
-            GTimer(), db_array_widx, db_array_wdata)
-        }
+        log("write_db_array: idx %d data %d\n",
+          db_array_widx, db_array_wdata)
         db_array.write(db_array_widx, db_array_wdata)
       }
 
@@ -429,9 +449,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
           state := s_idle
         }
         when (!hit) {
-          if (debug) {
-            printf("update_tag: idx: %d tag: %x repl_way: %d\n", idx, tag, repl_way)
-          }
+          log("update_tag: idx %d tag %x repl_way %d\n", idx, tag, repl_way)
           tag_array.write(idx, VecInit(Seq.fill(nWays) { tag }), Seq.tabulate(nWays)(repl_way === _.U))
         }
       }
@@ -455,7 +473,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         state := s_wait_ram_bresp
       }
       // when (!reset.asBool && out.w.fire()) {
-      //   bothHotOrNoneHot(wb_done, out_w.last, "L2 write back error")
+        bothHotOrNoneHot(wb_done, out_w.last, "L2 write back error")
       // }
 
       // write address channel signals
@@ -508,7 +526,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
             state := s_merge_put_data
           }
         }
-        // bothHotOrNoneHot(refill_done, out_r.last, "L2 refill error")
+        bothHotOrNoneHot(refill_done, out_r.last, "L2 refill error")
       }
 
       // read address channel signals
