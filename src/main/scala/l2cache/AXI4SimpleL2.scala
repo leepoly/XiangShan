@@ -13,42 +13,18 @@ import utils.GTimer
 case object NL2CacheCapacity extends Field[Int](2048)
 case object NL2CacheWays extends Field[Int](16)
 
-object CheckOneHot {
-  def apply(in: Seq[Bool]): Unit = {
-    val value = VecInit(in).asUInt
-    val length = in.length
-    def bitMap[T <: Data](f: Int => T) = VecInit((0 until length).map(f))
-    val bitOneHot = bitMap((w: Int) => value === (1 << w).asUInt(length.W)).asUInt
-    val oneHot = bitOneHot.orR
-    val noneHot = value === 0.U
-    assert(oneHot || noneHot)
-  }
-}
-
-// a and b must be both hot or none hot
-object bothHotOrNoneHot {
-  def apply(a: Bool, b: Bool, str: String): Unit = {
-    val cond = (a === b)
-      assert(cond, str)
-  }
-}
-
-object L4PerfAccumulator {
-  def apply(perfName: String, perfCnt: UInt)(implicit p: Parameters) = {
-      val counter = RegInit(0.U(64.W))
-      val next_counter = counter + perfCnt
-      counter := next_counter
-      when (GTimer() % 1000000.U === 0.U) {
-        printf(p"[l4counter] $perfName, $next_counter\n")
-      }
-  }
+class L4MetadataEntry(tagBits: Int) extends Bundle {
+  val valid = Bool()
+  val dirty = Bool()
+  val tag = UInt(width = tagBits.W)
+  // override def cloneType = new L4MetadataEntry(tagBits).asInstanceOf[this.type]
 }
 
 // ============================== DCache ==============================
 // TODO list:
 // 1. powerful stats (show all counters [nHit, nAccess] for every 10K cycles)
-// 2. integrate tag, vb, and db into MetaEntry
-// 3. Support large block size (and validate)
+// 2. [Done] integrate tag, vb, and db into MetaEntry
+// 3. [Done] Support large block size (and validate)
 // 4. Add sub-blocking into MetaEntry.
 
 class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
@@ -226,41 +202,28 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       }
 
       // s_tag_read: inspecting meta data
-      // valid bit array
-      val (vb_array, vb_omSRAM) = DescribedSRAM(
-        name = "L2_validbit_array",
-        desc = "L2 cache valid bit array",
+      val (meta_array, omSRAM) = DescribedSRAM(
+        name = "L2_meta_array",
+        desc = "L2 cache metadata array",
         size = nSets,
-        data = Bits(width = nWays.W)
+        data = Vec(nWays, new L4MetadataEntry(tagBits))
       )
-      val vb_array_wen = Wire(Bool())
-      // dirty bit array
-      val (db_array, db_omSRAM) = DescribedSRAM(
-        name = "L2_dirtybit_array",
-        desc = "L2 cache dirty bit array",
-        size = nSets,
-        data = Bits(width = nWays.W)
-      )
-      val db_array_wen = Wire(Bool())
 
-      val (tag_array, tag_omSRAM) = DescribedSRAM(
-        name = "L2_tag_array",
-        desc = "L2 cache tag array",
-        size = nSets,
-        data = Vec(nWays, UInt(width = tagBits.W))
-      )
-      val tag_raddr = Mux(in.ar.fire(), in_ar.addr, addr)
-      val tag_wen = Wire(Bool())
-      val tag_ridx = tag_raddr(indexMSB, indexLSB)
+      val meta_raddr = Mux(in.ar.fire(), in_ar.addr, addr)
+      val meta_array_wen = rst || state === s_update_meta
+      val meta_ridx = meta_raddr(indexMSB, indexLSB)
 
-      val vb_rdata = vb_array.read(tag_ridx, !vb_array_wen)
-      val db_rdata = db_array.read(tag_ridx, !db_array_wen)
-      val tag_rdata = tag_array.read(tag_ridx, !tag_wen)
+      val meta_rdata = meta_array.read(meta_ridx, !meta_array_wen)
 
       val idx = addr(indexMSB, indexLSB)
       val tag = addr(tagMSB, tagLSB)
 
       def wayMap[T <: Data](f: Int => T) = VecInit((0 until nWays).map(f))
+
+      val vb_rdata = wayMap((w: Int) => meta_rdata(w).valid).asUInt
+      val db_rdata = wayMap((w: Int) => meta_rdata(w).dirty).asUInt
+      val tag_rdata = wayMap((w: Int) => meta_rdata(w).tag)
+
       val tag_eq_way = wayMap((w: Int) => tag_rdata(w) === tag)
       val tag_match_way = wayMap((w: Int) => tag_eq_way(w) && vb_rdata(w)).asUInt
       val hit = tag_match_way.orR
@@ -419,38 +382,50 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       }
 
       // s_update_meta
-      val way = Mux(write_hit, hit_way, repl_way)
+      val update_way = Mux(write_hit, hit_way, repl_way)
+      val update_metadata = Wire(Vec(nWays, new L4MetadataEntry(tagBits)))
+      val rst_metadata = Wire(Vec(nWays, new L4MetadataEntry(tagBits)))
 
-      vb_array_wen := rst || state === s_update_meta
-      val vb_array_widx = Mux(rst, rst_cnt, idx)
-      val vb_array_wdata = Mux(rst, 0.U(nWays.W), vb_rdata.bitSet(way, true.B))
-
-      when (vb_array_wen) {
-        log("write_vb_array: idx %d data %d\n",
-            vb_array_widx, vb_array_wdata)
-        vb_array.write(vb_array_widx, vb_array_wdata)
+      for (i <- 0 until nWays) {
+        val metadata = rst_metadata(i)
+        metadata.valid := false.B
+        metadata.dirty := false.B
+        metadata.tag := 0.U
       }
 
-      db_array_wen := rst || state === s_update_meta
-      val db_array_widx = Mux(rst, rst_cnt, idx)
-      val db_array_wdata = Mux(rst, 0.U(nWays.W), db_rdata.bitSet(way, wen))
-      when (db_array_wen) {
-        log("write_db_array: idx %d data %d\n",
-          db_array_widx, db_array_wdata)
-        db_array.write(db_array_widx, db_array_wdata)
+      for (i <- 0 until nWays) {
+        val metadata = update_metadata(i)
+        val is_update_way = update_way === i.U
+        when (is_update_way) {
+          metadata.valid := true.B
+          metadata.dirty := db_rdata(i) | wen
+            // Mux(read_hit, db_rdata(i),
+            // Mux(read_miss, false.B, true.B))
+          metadata.tag := tag
+        } .otherwise {
+          metadata.valid := vb_rdata(i)
+          metadata.dirty := db_rdata(i)
+          metadata.tag := tag_rdata(i)
+        }
       }
 
-      tag_wen := state === s_update_meta
+      val meta_array_widx = Mux(rst, rst_cnt, idx)
+      val meta_array_wdata = Mux(rst, rst_metadata, update_metadata)
+
+      when (meta_array_wen) {
+        meta_array.write(meta_array_widx, meta_array_wdata)
+        when (!hit && !rst) {
+          assert(update_way === repl_way, "update must = repl way when cache miss")
+          log("update_tag: idx %d tag %x valid %x dirty %x repl_way %d\n", idx, update_metadata(update_way).tag, update_metadata(update_way).valid, update_metadata(update_way).dirty, repl_way)
+        }
+      }
+
       when (state === s_update_meta) {
         // refill done
         when (ren) {
           state := s_data_resp
         } .otherwise {
           state := s_idle
-        }
-        when (!hit) {
-          log("update_tag: idx %d tag %x repl_way %d\n", idx, tag, repl_way)
-          tag_array.write(idx, VecInit(Seq.fill(nWays) { tag }), Seq.tabulate(nWays)(repl_way === _.U))
         }
       }
 
