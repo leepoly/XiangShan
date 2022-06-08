@@ -27,7 +27,7 @@ class L4MetadataEntry(tagBits: Int, nSubblk: Int) extends Bundle {
 // 1. powerful stats (show all counters [nHit, nAccess] for every 10K cycles)
 // 2. [Done] integrate tag, vb, and db into MetaEntry
 // 3. [Done] Support large block size (and validate)
-// 4. Add sub-blocking into MetaEntry.
+// 4. [Done] Add sub-blocking into MetaEntry.
 
 class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 {
@@ -47,7 +47,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 
       val Y = true.B
       val N = false.B
-      val debug = true // TODO: disable debug
+      val debug = false
 
       val subblockSizeBits = subblockSize * 8
       val subblockBytes = subblockSize
@@ -85,6 +85,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       val indexBits = log2Ceil(nSets)
       val subblockOffsetBits = log2Ceil(subblockBytes)
       val subblkIdBits = log2Ceil(nSubblk)
+      assert(subblkIdBits > 0)
       val tagBits = addrWidth - indexBits - subblkIdBits - subblockOffsetBits
       val offsetLSB = 0
       val offsetMSB = subblockOffsetBits - 1
@@ -264,19 +265,18 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 
       // use random replacement
       val lfsr = LFSR(log2Ceil(nWays), state === s_update_meta && !block_hit)
-      // val repl_way_enable = (state === s_idle && in.ar.fire()) || (state === s_send_bresp && in.b.fire())
-      // val repl_way = RegEnable(next = if(nWays == 1) 0.U else lfsr(log2Ceil(nWays) - 1, 0),
-      //   init = 0.U, enable = repl_way_enable)
-      val repl_way = 0.U // TODO: try 1-way
+      val repl_way_enable = (state === s_idle && in.ar.fire()) || (state === s_send_bresp && in.b.fire())
+      val repl_way = RegEnable(next = if(nWays == 1) 0.U else lfsr(log2Ceil(nWays) - 1, 0),
+        init = 0.U, enable = repl_way_enable)
+      // val repl_way = 0.U
 
       // valid and dirty
       // writeback in the block level
-      // val need_writeback = !block_hit && block_vb_rdata(repl_way) && block_db_rdata(repl_way)
-      val need_writeback = !block_hit && true.B // TODO: try always writeback
+      val need_writeback = !block_hit && block_vb_rdata(repl_way) && block_db_rdata(repl_way)
+      // val need_writeback = !block_hit && true.B
       val writeback_tag = tag_rdata(repl_way)
       val wb_subblkId = RegInit(0.U((subblkIdBits).W))
       val writeback_addr = Cat(writeback_tag, Cat(idx, Cat(wb_subblkId, 0.U(subblockOffsetBits.W))))
-       // TODO: consider nSubblk = 1
 
       val block_read_miss_writeback = block_read_miss && need_writeback // situation 5
       val block_read_miss_no_writeback = block_read_miss && !need_writeback // situation 6
@@ -339,7 +339,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       // #                  data array read/write                      #
       // ###############################################################
       // data array read idx and beat number are different for situation (5, 7) and (1, 2)
-      val data_read_way = Mux(block_read_hit || block_write_hit, hit_way, repl_way)
+      val data_read_way = Mux(block_hit, hit_way, repl_way)
       // incase it overflows
       val data_read_cnt = RegInit(0.U((innerBeatIndexBits + 1).W))
       val data_read_is_last_beat = data_read_cnt === innerDataBeats.U
@@ -348,7 +348,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
                               (idx << (innerBeatIndexBits + subblkIdBits)) | (subblkId << innerBeatIndexBits) | data_read_cnt)
       val dout = Wire(Vec(split, UInt(outerBeatSize.W)))
 
-      val data_write_way = Mux(block_write_hit, hit_way, repl_way)
+      val data_write_way = Mux(block_hit, hit_way, repl_way)
       val data_write_cnt = Wire(UInt())
       val data_write_valid = state === s_data_write
       val data_write_idx = (idx << (innerBeatIndexBits + subblkIdBits)) | (subblkId << innerBeatIndexBits) | data_write_cnt
@@ -430,7 +430,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       }
 
       // s_update_meta
-      val update_way = Mux(block_write_hit, hit_way, repl_way)
+      val update_way = Mux(block_hit, hit_way, repl_way)
       val update_metadata = Wire(Vec(nWays, new L4MetadataEntry(tagBits, nSubblk)))
       val rst_metadata = Wire(Vec(nWays, new L4MetadataEntry(tagBits, nSubblk)))
 
