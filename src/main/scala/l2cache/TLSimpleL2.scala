@@ -9,10 +9,6 @@ import freechips.rocketchip.tilelink._
 import scala.math._
 import utils.GTimer
 
-case object NL4CacheCapacity extends Field[Int](2048)
-case object NL4CacheWays extends Field[Int](16)
-case object NL4BanksPerMemChannel extends Field[Int](4)
-
 trait HasL4CacheParameters {
   implicit val p: Parameters
   val nL4Banks = p(NL4BanksPerMemChannel)

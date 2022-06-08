@@ -10,8 +10,9 @@ import freechips.rocketchip.amba.axi4._
 import scala.math._
 import utils.GTimer
 
-case object NL2CacheCapacity extends Field[Int](2048)
-case object NL2CacheWays extends Field[Int](16)
+case object NL4CacheCapacity extends Field[Int](8192)
+case object NL4CacheWays extends Field[Int](16)
+case object NL4BanksPerMemChannel extends Field[Int](4)
 
 class L4MetadataEntry(tagBits: Int, nSubblk: Int) extends Bundle {
   val valid = Bool()
@@ -33,11 +34,11 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
   val node = AXI4AdapterNode()
 
   lazy val module = new LazyModuleImp(this) {
-    val nWays = p(NL4CacheWays)
-    val nSets = p(NL4CacheCapacity) * 1024 / 64 / nWays
     val subblockSize = 64 // in bytes
     val nSubblk = 2
     val blockSize = subblockSize * nSubblk
+    val nWays = p(NL4CacheWays)
+    val nSets = p(NL4CacheCapacity) / blockSize / nWays
     (node.in zip node.out) foreach { case ((in, edgeIn), (out, edgeOut)) =>
       require(isPow2(nSets))
       require(isPow2(nWays))
@@ -46,7 +47,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 
       val Y = true.B
       val N = false.B
-      val debug = false
+      val debug = true // TODO: disable debug
 
       val subblockSizeBits = subblockSize * 8
       val subblockBytes = subblockSize
@@ -63,7 +64,6 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       val outerBeatSize = out.r.bits.params.dataBits
       val outerBeatBytes = outerBeatSize / 8
       val outerSubblkBeats = subblockSizeBits / outerBeatSize
-      val outerBlockBeats = blockSizeBits / outerBeatSize
       val addrWidth = in.ar.bits.params.addrBits
       val innerIdWidth = in.ar.bits.params.idBits
       val outerIdWidth = out.ar.bits.params.idBits
@@ -76,11 +76,10 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       require(isPow2(split))
       assert(split == 1) // TODO: I guess split is no use
       println("innerBeatBytes %d innerDataBeats %d", innerBeatBytes, innerDataBeats)
-      println("outerBlockBeats %d outerSubblkBeats %d", outerBlockBeats, outerSubblkBeats)
+      println("outerSubblkBeats %d", outerSubblkBeats)
       assert(innerBeatBytes == 32)
       assert(innerDataBeats == 2)
       assert(outerBeatBytes == 32)
-      assert(outerBlockBeats == 2 * nSubblk)
       assert(outerSubblkBeats == 2)
 
       val indexBits = log2Ceil(nSets)
@@ -208,7 +207,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         when (gather_last_beat) {
           state := s_send_bresp
         }
-        bothHotOrNoneHot(gather_last_beat, in_w.last, "L2 gather beat error")
+        bothHotOrNoneHot(gather_last_beat, in_w.last, "L4 gather beat error")
       }
 
       // s_send_bresp:
@@ -224,8 +223,8 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 
       // s_tag_read: inspecting meta data
       val (meta_array, omSRAM) = DescribedSRAM(
-        name = "L2_meta_array",
-        desc = "L2 cache metadata array",
+        name = "L4_meta_array",
+        desc = "L4 cache metadata array",
         size = nSets,
         data = Vec(nWays, new L4MetadataEntry(tagBits, nSubblk))
       )
@@ -265,17 +264,19 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 
       // use random replacement
       val lfsr = LFSR(log2Ceil(nWays), state === s_update_meta && !block_hit)
-      val block_repl_way_enable = (state === s_idle && in.ar.fire()) || (state === s_send_bresp && in.b.fire())
-      val block_repl_way = RegEnable(next = if(nWays == 1) 0.U else lfsr(log2Ceil(nWays) - 1, 0),
-        init = 0.U, enable = block_repl_way_enable)
-      // TODO: here repl_way Mux seems useless. Just use block_repl_way
-      val repl_way = Mux(block_hit, hit_way, block_repl_way)
+      // val repl_way_enable = (state === s_idle && in.ar.fire()) || (state === s_send_bresp && in.b.fire())
+      // val repl_way = RegEnable(next = if(nWays == 1) 0.U else lfsr(log2Ceil(nWays) - 1, 0),
+      //   init = 0.U, enable = repl_way_enable)
+      val repl_way = 0.U // TODO: try 1-way
 
       // valid and dirty
       // writeback in the block level
-      val need_writeback = !block_hit && block_vb_rdata(repl_way) && block_db_rdata(repl_way)
+      // val need_writeback = !block_hit && block_vb_rdata(repl_way) && block_db_rdata(repl_way)
+      val need_writeback = !block_hit && true.B // TODO: try always writeback
       val writeback_tag = tag_rdata(repl_way)
-      val writeback_addr = Cat(writeback_tag, Cat(idx, Cat(0.U(subblkIdBits.W), 0.U(subblockOffsetBits.W)))) // TODO: consider nSubblk = 0
+      val wb_subblkId = RegInit(0.U((subblkIdBits).W))
+      val writeback_addr = Cat(writeback_tag, Cat(idx, Cat(wb_subblkId, 0.U(subblockOffsetBits.W))))
+       // TODO: consider nSubblk = 1
 
       val block_read_miss_writeback = block_read_miss && need_writeback // situation 5
       val block_read_miss_no_writeback = block_read_miss && !need_writeback // situation 6
@@ -290,13 +291,18 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
                             // situation: 3, 4, 6, 8
 
       when (state === s_tag_read) {
-        log("req: isread %x iswrite %x addr %x idx %d tag %x subblkId %x blkHit %d subblkHit %d block_hit_way %x repl_way %x needwb %x wbaddr %x",
+        log("req: isread %x iswrite %x addr %x idx %d tag %x subblkId %x blkHit %d subblkHit %d hit_way %x",
             ren, wen,
             addr,
             idx, tag, subblkId,
-            block_hit, subblock_hit, hit_way,
-            repl_way,
-            need_writeback, writeback_addr)
+            block_hit, subblock_hit, hit_way)
+        when (!block_hit) {
+          log("\tmiss repl_way %x repl_valid %x repl_dirty %x repl_subblkValid %x needwb %x wbaddr %x",
+              repl_way, block_vb_rdata(repl_way), block_db_rdata(repl_way), subblock_vb_rdata(repl_way), need_writeback, writeback_addr)
+        } .otherwise {
+          log("\thit hit_way %x hit_valid %x hit_dirty %x hit_subblkValid %x",
+              hit_way, block_vb_rdata(hit_way), block_db_rdata(hit_way), subblock_vb_rdata(hit_way))
+        }
         // printf("[L4cache] time %d req: isread %x iswrite %x addr %x idx %d tag %x hit %d hit_way %x repl_way %x needwb %x wbaddr %x\n",
         //     GTimer(), ren, wen,
         //     addr,
@@ -318,6 +324,9 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 
         when (need_data_read) {
           state := s_data_read
+          when (need_writeback) {
+            log("writeback start: idx %d way %x addr %x subblkId %x ", idx, repl_way, writeback_addr, wb_subblkId)
+          }
         } .elsewhen (no_need_data_read) {
           // no need to write back, directly refill data
           state := s_wait_ram_arready
@@ -333,11 +342,9 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       val data_read_way = Mux(block_read_hit || block_write_hit, hit_way, repl_way)
       // incase it overflows
       val data_read_cnt = RegInit(0.U((innerBeatIndexBits + 1).W))
-      val wb_data_read_cnt = RegInit(0.U((innerBeatIndexBits + subblkIdBits + 1).W))
-      val data_read_is_last_beat = Mux(need_writeback, wb_data_read_cnt === ((nSubblk * innerDataBeats).U),
-                                        data_read_cnt === innerDataBeats.U)
+      val data_read_is_last_beat = data_read_cnt === innerDataBeats.U
       val data_read_valid = (state === s_tag_read && need_data_read) || (state === s_data_read && !data_read_is_last_beat)
-      val data_read_idx = Mux(need_writeback, (idx << (innerBeatIndexBits + subblkIdBits)) | wb_data_read_cnt,
+      val data_read_idx = Mux(need_writeback, (idx << (innerBeatIndexBits + subblkIdBits)) | (wb_subblkId << innerBeatIndexBits) | data_read_cnt,
                               (idx << (innerBeatIndexBits + subblkIdBits)) | (subblkId << innerBeatIndexBits) | data_read_cnt)
       val dout = Wire(Vec(split, UInt(outerBeatSize.W)))
 
@@ -349,8 +356,8 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 
       val data_arrays = Seq.fill(split) {
         DescribedSRAM(
-          name = "L2_data_array",
-          desc = "L2 data array",
+          name = "L4_data_array",
+          desc = "L4 data array",
           size = nSets * nSubblk * innerDataBeats,
           data = Vec(nWays, UInt(width = outerBeatSize.W))
         )
@@ -363,30 +370,24 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         }
         dout(i) := data_array.read(data_read_idx, data_read_valid && !data_write_valid)(data_read_way)
         when (RegNext(data_read_valid, N)) {
-          val sel_data_read_cnt = Mux(need_writeback, wb_data_read_cnt, data_read_cnt)
+          val sel_subblkId = Mux(need_writeback, wb_subblkId, subblkId)
           log("read data array: %d idx %d subblkId %d way %d wb %x cnt %d data %x\n",
-            i.U, RegNext(idx), RegNext(subblkId), RegNext(data_read_way), RegNext(need_writeback), RegNext(sel_data_read_cnt), dout(i))
+            i.U, RegNext(idx), RegNext(sel_subblkId), RegNext(data_read_way), RegNext(need_writeback), RegNext(data_read_cnt), dout(i))
         }
       }
 
       // s_data_read
       // read miss or need write back
       val data_buf = Reg(Vec(outerSubblkBeats, UInt(outerBeatSize.W)))
-      val wb_data_buf = Reg(Vec(outerSubblkBeats * nSubblk, UInt(outerBeatSize.W)))
       when (data_read_valid) {
         data_read_cnt := data_read_cnt + 1.U
-        wb_data_read_cnt := wb_data_read_cnt + 1.U
       }
       when (state === s_data_read) {
         for (i <- 0 until split) {
           data_buf(((data_read_cnt - 1.U) << splitBits) + i.U) := dout(i)
         }
-        for (i <- 0 until split) {
-          wb_data_buf(((wb_data_read_cnt - 1.U) << splitBits) + i.U) := dout(i)
-        }
         when (data_read_is_last_beat) {
           data_read_cnt := 0.U
-          wb_data_read_cnt := 0.U
           when (subblock_read_hit) {
             state := s_data_resp
           } .elsewhen (block_read_miss_writeback || block_write_miss_writeback) {
@@ -492,18 +493,21 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         state := s_do_ram_write
       }
 
-      val (wb_cnt, wb_done) = Counter(out.w.fire() && state === s_do_ram_write, outerBlockBeats)
+      val (wb_cnt, wb_done) = Counter(out.w.fire() && state === s_do_ram_write, outerSubblkBeats)
       when (state === s_do_ram_write && wb_done) {
         state := s_wait_ram_bresp
       }
+      when (state === s_do_ram_write && out.w.fire()) {
+        log("data_writeback: idx %d tag %x mem_addr %x cnt %x wb_done %x wbSubId %x subValid %x wb_strb %x wb_data %x\n", idx, writeback_tag, writeback_addr, wb_cnt, wb_done, wb_subblkId, subblock_vb_rdata(repl_way), out_w.strb, out_w.data)
+      }
       when (!reset.asBool && out.w.fire()) {
-        bothHotOrNoneHot(wb_done, out_w.last, "L2 write back error")
+        bothHotOrNoneHot(wb_done, out_w.last, "L4 write back error")
       }
 
       // write address channel signals
       out_aw.id := 0.U(outerIdWidth.W)
       out_aw.addr := writeback_addr
-      out_aw.len := (outerBlockBeats - 1).U(8.W)
+      out_aw.len := (outerSubblkBeats - 1).U(8.W)
       out_aw.size := axi4_size
       out_aw.burst := "b01".U       // normal sequential memory
       out_aw.lock := 0.U(1.W)
@@ -516,16 +520,27 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 
       // write data channel signals
       //out_w.id := 0.U(outerIdWidth.W)
-      out_w.data := wb_data_buf(wb_cnt)
-      out_w.strb := Fill(outerBeatBytes, 1.U(1.W))
-      out_w.last := wb_cnt === (outerBlockBeats - 1).U
+      out_w.data := data_buf(wb_cnt)
+      val out_w_strb = Mux(subblock_vb_rdata(repl_way)(wb_subblkId), Fill(outerBeatBytes, 1.U(1.W)),
+                            Fill(outerBeatBytes, 0.U(1.W))) // no-op for invalid lines
+      out_w.strb := out_w_strb
+      out_w.last := wb_cnt === (outerSubblkBeats - 1).U
       //out_w.user := 0.U(5.W)
       out.w.valid := state === s_do_ram_write
 
       when (state === s_wait_ram_bresp && out.b.fire()) {
         when (block_read_miss_writeback || block_write_miss_writeback) {
-          // do refill
-          state := s_wait_ram_arready
+          when (wb_subblkId === (nSubblk - 1).U) {
+            // do refill
+            state := s_wait_ram_arready
+            wb_subblkId := 0.U
+            log("writeback complete: idx %d way %x addr %x subblkId %d ", idx, repl_way, writeback_addr, wb_subblkId)
+          } .otherwise {
+            log("writeback done for idx %d way %x addr %x subblkId %d ", idx, repl_way, writeback_addr, wb_subblkId)
+            state := s_data_read
+            wb_subblkId := wb_subblkId + 1.U
+            assert(wb_subblkId <= nSubblk.U)
+          }
         } .otherwise {
           assert(N, "Unexpected condition in s_wait_ram_bresp")
         }
@@ -551,7 +566,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
           }
         }
         log("data_refill: idx %d tag %x subblkId %x mem_addr %x cnt %x refill_data %x\n", idx, tag, subblkId, mem_addr, refill_cnt, out_r.data)
-        bothHotOrNoneHot(refill_done, out_r.last, "L2 refill error")
+        bothHotOrNoneHot(refill_done, out_r.last, "L4 refill error")
       }
 
       // read address channel signals
@@ -585,7 +600,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         when (resp_last_beat) {
           state := s_idle
         }
-        log("data_resp: idx %d tag %x subblkId %x req_addr %x cnt %x resp_data %x\n", idx, tag, subblkId, in_ar.addr, resp_curr_beat, resp_data.asUInt)
+        log("data_resp: idx %d tag %x subblkId %x req_addr %x cnt %x resp_data %x\n", idx, tag, subblkId, addr, resp_curr_beat, resp_data.asUInt)
       }
 
       in_r.id := id
