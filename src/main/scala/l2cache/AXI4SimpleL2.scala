@@ -16,9 +16,10 @@ case object NL4BanksPerMemChannel extends Field[Int](4)
 
 class L4MetadataEntry(tagBits: Int, nSubblk: Int) extends Bundle {
   val valid = Bool()
-  val dirty = Bool()
+  val dirty = Bool() // TODO: remove me
   val tag = UInt(width = tagBits.W)
   val subblockValid = UInt(width = nSubblk.W)
+  val subblockDirty = UInt(width = nSubblk.W)
   // override def cloneType = new L4MetadataEntry(tagBits).asInstanceOf[this.type]
 }
 
@@ -243,9 +244,10 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       def wayMap[T <: Data](f: Int => T) = VecInit((0 until nWays).map(f))
 
       val block_vb_rdata = wayMap((w: Int) => meta_rdata(w).valid).asUInt
-      val block_db_rdata = wayMap((w: Int) => meta_rdata(w).dirty).asUInt
+      val block_db_rdata = wayMap((w: Int) => meta_rdata(w).dirty).asUInt // TODO: remove me
       val tag_rdata = wayMap((w: Int) => meta_rdata(w).tag)
       val subblock_vb_rdata = wayMap((w: Int) => meta_rdata(w).subblockValid)
+      val subblock_db_rdata = wayMap((w: Int) => meta_rdata(w).subblockDirty)
 
       val tag_eq_way = wayMap((w: Int) => tag_rdata(w) === tag)
       val tag_match_way = wayMap((w: Int) => tag_eq_way(w) && block_vb_rdata(w)).asUInt
@@ -274,10 +276,12 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       // writeback in the block level
       val need_writeback = !block_hit && block_vb_rdata(repl_way) && block_db_rdata(repl_way)
       // val need_writeback = !block_hit && true.B
+      // TODO: need_writeback: sub-block level
       val writeback_tag = tag_rdata(repl_way)
       val wb_subblkId = RegInit(0.U((subblkIdBits).W))
       val writeback_addr = Cat(writeback_tag, Cat(idx, Cat(wb_subblkId, 0.U(subblockOffsetBits.W))))
 
+      // TODO: adjust accordingly
       val block_read_miss_writeback = block_read_miss && need_writeback // situation 5
       val block_read_miss_no_writeback = block_read_miss && !need_writeback // situation 6
       val block_write_miss_writeback = block_write_miss && need_writeback // situation 7
@@ -297,11 +301,11 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
             idx, tag, subblkId,
             block_hit, subblock_hit, hit_way)
         when (!block_hit) {
-          log("\tmiss repl_way %x repl_valid %x repl_dirty %x repl_subblkValid %x needwb %x wbaddr %x",
-              repl_way, block_vb_rdata(repl_way), block_db_rdata(repl_way), subblock_vb_rdata(repl_way), need_writeback, writeback_addr)
+          log("\tmiss repl_way %x repl_valid %x repl_dirty %x repl_subblkValid %x repl_subblkDirty %x needwb %x wbaddr %x",
+              repl_way, block_vb_rdata(repl_way), block_db_rdata(repl_way), subblock_vb_rdata(repl_way), subblock_db_rdata(repl_way), need_writeback, writeback_addr)
         } .otherwise {
-          log("\thit hit_way %x hit_valid %x hit_dirty %x hit_subblkValid %x",
-              hit_way, block_vb_rdata(hit_way), block_db_rdata(hit_way), subblock_vb_rdata(hit_way))
+          log("\thit hit_way %x hit_valid %x hit_dirty %x hit_subblkValid %x hit_subblkDirty %x",
+              hit_way, block_vb_rdata(hit_way), block_db_rdata(hit_way), subblock_vb_rdata(hit_way), subblock_db_rdata(hit_way))
         }
         // printf("[L4cache] time %d req: isread %x iswrite %x addr %x idx %d tag %x hit %d hit_way %x repl_way %x needwb %x wbaddr %x\n",
         //     GTimer(), ren, wen,
@@ -440,6 +444,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         metadata.dirty := false.B
         metadata.tag := 0.U
         metadata.subblockValid := 0.U(nSubblk.W)
+        metadata.subblockDirty := 0.U(nSubblk.W)
       }
 
       for (i <- 0 until nWays) {
@@ -447,15 +452,18 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         val is_update_way = update_way === i.U
         when (is_update_way) {
           metadata.valid := true.B
-          metadata.dirty := block_db_rdata(i) | wen
           metadata.tag := tag
           metadata.subblockValid := Mux(block_hit, subblock_vb_rdata(i) | (1.U << subblkId),
                                     1.U << subblkId)
+          metadata.subblockDirty := Mux(block_hit, subblock_db_rdata(i) | (wen << subblkId),
+                                    (wen << subblkId))
+          metadata.dirty := metadata.subblockDirty.orR
         } .otherwise {
           metadata.valid := block_vb_rdata(i)
           metadata.dirty := block_db_rdata(i)
           metadata.tag := tag_rdata(i)
           metadata.subblockValid := subblock_vb_rdata(i)
+          metadata.subblockDirty := subblock_db_rdata(i)
         }
       }
 
@@ -466,7 +474,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         meta_array.write(meta_array_widx, meta_array_wdata)
         when (!block_hit && !rst) {
           assert(update_way === repl_way, "update must = repl way when cache miss")
-          log("update_tag: idx %d tag %x valid %x dirty %x subValid %x repl_way %d\n", idx, update_metadata(update_way).tag, update_metadata(update_way).valid, update_metadata(update_way).dirty, update_metadata(update_way).subblockValid, repl_way)
+          log("update_tag: idx %d tag %x valid %x dirty %x subValid %x subDirty %x repl_way %d\n", idx, update_metadata(update_way).tag, update_metadata(update_way).valid, update_metadata(update_way).dirty, update_metadata(update_way).subblockValid, update_metadata(update_way).subblockDirty, repl_way)
         }
       }
 
@@ -498,7 +506,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         state := s_wait_ram_bresp
       }
       when (state === s_do_ram_write && out.w.fire()) {
-        log("data_writeback: idx %d tag %x mem_addr %x cnt %x wb_done %x wbSubId %x subValid %x wb_strb %x wb_data %x\n", idx, writeback_tag, writeback_addr, wb_cnt, wb_done, wb_subblkId, subblock_vb_rdata(repl_way), out_w.strb, out_w.data)
+        log("data_writeback: idx %d tag %x mem_addr %x cnt %x wb_done %x wbSubId %x subValid %x subDirty %x wb_strb %x wb_data %x\n", idx, writeback_tag, writeback_addr, wb_cnt, wb_done, wb_subblkId, subblock_vb_rdata(repl_way), subblock_db_rdata(repl_way), out_w.strb, out_w.data)
       }
       when (!reset.asBool && out.w.fire()) {
         bothHotOrNoneHot(wb_done, out_w.last, "L4 write back error")
@@ -521,7 +529,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       // write data channel signals
       //out_w.id := 0.U(outerIdWidth.W)
       out_w.data := data_buf(wb_cnt)
-      val out_w_strb = Mux(subblock_vb_rdata(repl_way)(wb_subblkId), Fill(outerBeatBytes, 1.U(1.W)),
+      val out_w_strb = Mux(subblock_db_rdata(repl_way)(wb_subblkId), Fill(outerBeatBytes, 1.U(1.W)),
                             Fill(outerBeatBytes, 0.U(1.W))) // no-op for invalid lines
       out_w.strb := out_w_strb
       out_w.last := wb_cnt === (outerSubblkBeats - 1).U
