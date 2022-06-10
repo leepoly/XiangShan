@@ -16,7 +16,6 @@ case object NL4BanksPerMemChannel extends Field[Int](4)
 
 class L4MetadataEntry(tagBits: Int, nSubblk: Int) extends Bundle {
   val valid = Bool()
-  val dirty = Bool() // TODO: remove me
   val tag = UInt(width = tagBits.W)
   val subblockValid = UInt(width = nSubblk.W)
   val subblockDirty = UInt(width = nSubblk.W)
@@ -29,6 +28,10 @@ class L4MetadataEntry(tagBits: Int, nSubblk: Int) extends Bundle {
 // 2. [Done] integrate tag, vb, and db into MetaEntry
 // 3. [Done] Support large block size (and validate)
 // 4. [Done] Add sub-blocking into MetaEntry.
+// 5. [Done] Add per-block dirty information.
+// 6. Per-superblock tag and sub-blocking
+// 7. Zero-leading compression
+// 8. FPC/BDI compression
 
 class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 {
@@ -48,7 +51,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 
       val Y = true.B
       val N = false.B
-      val debug = false
+      val debug = true // TODO: disable debug
 
       val subblockSizeBits = subblockSize * 8
       val subblockBytes = subblockSize
@@ -244,7 +247,6 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       def wayMap[T <: Data](f: Int => T) = VecInit((0 until nWays).map(f))
 
       val block_vb_rdata = wayMap((w: Int) => meta_rdata(w).valid).asUInt
-      val block_db_rdata = wayMap((w: Int) => meta_rdata(w).dirty).asUInt // TODO: remove me
       val tag_rdata = wayMap((w: Int) => meta_rdata(w).tag)
       val subblock_vb_rdata = wayMap((w: Int) => meta_rdata(w).subblockValid)
       val subblock_db_rdata = wayMap((w: Int) => meta_rdata(w).subblockDirty)
@@ -274,14 +276,13 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 
       // valid and dirty
       // writeback in the block level
-      val need_writeback = !block_hit && block_vb_rdata(repl_way) && block_db_rdata(repl_way)
+      val need_writeback = !block_hit && subblock_db_rdata(repl_way).orR
       // val need_writeback = !block_hit && true.B
-      // TODO: need_writeback: sub-block level
       val writeback_tag = tag_rdata(repl_way)
       val wb_subblkId = RegInit(0.U((subblkIdBits).W))
       val writeback_addr = Cat(writeback_tag, Cat(idx, Cat(wb_subblkId, 0.U(subblockOffsetBits.W))))
 
-      // TODO: adjust accordingly
+      // TODO: for superblock-subblocking, no writeback unless supertag mismatch
       val block_read_miss_writeback = block_read_miss && need_writeback // situation 5
       val block_read_miss_no_writeback = block_read_miss && !need_writeback // situation 6
       val block_write_miss_writeback = block_write_miss && need_writeback // situation 7
@@ -301,11 +302,11 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
             idx, tag, subblkId,
             block_hit, subblock_hit, hit_way)
         when (!block_hit) {
-          log("\tmiss repl_way %x repl_valid %x repl_dirty %x repl_subblkValid %x repl_subblkDirty %x needwb %x wbaddr %x",
-              repl_way, block_vb_rdata(repl_way), block_db_rdata(repl_way), subblock_vb_rdata(repl_way), subblock_db_rdata(repl_way), need_writeback, writeback_addr)
+          log("\tmiss repl_way %x repl_valid %x repl_subblkValid %x repl_subblkDirty %x needwb %x wbaddr %x",
+              repl_way, block_vb_rdata(repl_way), subblock_vb_rdata(repl_way), subblock_db_rdata(repl_way), need_writeback, writeback_addr)
         } .otherwise {
-          log("\thit hit_way %x hit_valid %x hit_dirty %x hit_subblkValid %x hit_subblkDirty %x",
-              hit_way, block_vb_rdata(hit_way), block_db_rdata(hit_way), subblock_vb_rdata(hit_way), subblock_db_rdata(hit_way))
+          log("\thit hit_way %x hit_valid %x hit_subblkValid %x hit_subblkDirty %x",
+              hit_way, block_vb_rdata(hit_way), subblock_vb_rdata(hit_way), subblock_db_rdata(hit_way))
         }
         // printf("[L4cache] time %d req: isread %x iswrite %x addr %x idx %d tag %x hit %d hit_way %x repl_way %x needwb %x wbaddr %x\n",
         //     GTimer(), ren, wen,
@@ -321,7 +322,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         //   log("%x ", tag_rdata(i))
         // }
         // log("\n")
-        // log("time: %d [L4Cache] s1 vb: %x db: %x\n", GTimer(), block_vb_rdata, block_db_rdata)
+        // log("time: %d [L4Cache] s1 vb: %x\n", GTimer(), block_vb_rdata)
 
         // check for cross cache line bursts
         assert(inner_end_beat < innerDataBeats.U, "cross cache line bursts detected")
@@ -441,7 +442,6 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       for (i <- 0 until nWays) {
         val metadata = rst_metadata(i)
         metadata.valid := false.B
-        metadata.dirty := false.B
         metadata.tag := 0.U
         metadata.subblockValid := 0.U(nSubblk.W)
         metadata.subblockDirty := 0.U(nSubblk.W)
@@ -457,10 +457,8 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
                                     1.U << subblkId)
           metadata.subblockDirty := Mux(block_hit, subblock_db_rdata(i) | (wen << subblkId),
                                     (wen << subblkId))
-          metadata.dirty := metadata.subblockDirty.orR
         } .otherwise {
           metadata.valid := block_vb_rdata(i)
-          metadata.dirty := block_db_rdata(i)
           metadata.tag := tag_rdata(i)
           metadata.subblockValid := subblock_vb_rdata(i)
           metadata.subblockDirty := subblock_db_rdata(i)
@@ -474,7 +472,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         meta_array.write(meta_array_widx, meta_array_wdata)
         when (!block_hit && !rst) {
           assert(update_way === repl_way, "update must = repl way when cache miss")
-          log("update_tag: idx %d tag %x valid %x dirty %x subValid %x subDirty %x repl_way %d\n", idx, update_metadata(update_way).tag, update_metadata(update_way).valid, update_metadata(update_way).dirty, update_metadata(update_way).subblockValid, update_metadata(update_way).subblockDirty, repl_way)
+          log("update_tag: idx %d tag %x valid %x subValid %x subDirty %x repl_way %d\n", idx, update_metadata(update_way).tag, update_metadata(update_way).valid, update_metadata(update_way).subblockValid, update_metadata(update_way).subblockDirty, repl_way)
         }
       }
 
