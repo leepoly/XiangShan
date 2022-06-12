@@ -10,16 +10,16 @@ import freechips.rocketchip.amba.axi4._
 import scala.math._
 import utils.GTimer
 
-case object NL4CacheCapacity extends Field[Int](8192)
+case object NL4CacheCapacity extends Field[Int](4096)
 case object NL4CacheWays extends Field[Int](16)
 case object NL4BanksPerMemChannel extends Field[Int](4)
 
-class L4MetadataEntry(tagBits: Int, nSubblk: Int) extends Bundle {
+class L4MetadataEntry(superblockTagBits: Int, nSubblk: Int, intraSlotIdBits: Int) extends Bundle {
   val valid = Bool()
-  val tag = UInt(width = tagBits.W)
+  val superblockTag = UInt(width = superblockTagBits.W)
   val subblockValid = UInt(width = nSubblk.W)
   val subblockDirty = UInt(width = nSubblk.W)
-  // override def cloneType = new L4MetadataEntry(tagBits).asInstanceOf[this.type]
+  val intraSlotId = Vec(nSubblk, UInt(intraSlotIdBits.W))
 }
 
 // ============================== DCache ==============================
@@ -29,6 +29,7 @@ class L4MetadataEntry(tagBits: Int, nSubblk: Int) extends Bundle {
 // 3. [Done] Support large block size (and validate)
 // 4. [Done] Add sub-blocking into MetaEntry.
 // 5. [Done] Add per-block dirty information.
+// 6. Per-block sub-blocking
 // 6. Per-superblock tag and sub-blocking
 // 7. Zero-leading compression
 // 8. FPC/BDI compression
@@ -40,7 +41,10 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
   lazy val module = new LazyModuleImp(this) {
     val subblockSize = 64 // in bytes
     val nSubblk = 2
+    val nBlockPerSuperblock = 2
     val blockSize = subblockSize * nSubblk
+    val superblockSize = blockSize * nBlockPerSuperblock
+    val nIntraSlot = superblockSize / subblockSize
     val nWays = p(NL4CacheWays)
     val nSets = p(NL4CacheCapacity) / blockSize / nWays
     (node.in zip node.out) foreach { case ((in, edgeIn), (out, edgeOut)) =>
@@ -89,34 +93,43 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       val indexBits = log2Ceil(nSets)
       val subblockOffsetBits = log2Ceil(subblockBytes)
       val subblkIdBits = log2Ceil(nSubblk)
+      val blockIdBits = log2Ceil(nBlockPerSuperblock)
+      val intraSlotIdBits = log2Ceil(nIntraSlot)
+      assert(intraSlotIdBits == subblkIdBits + blockIdBits)
       assert(subblkIdBits > 0)
-      val tagBits = addrWidth - indexBits - subblkIdBits - subblockOffsetBits
+      val superblockTagBits = addrWidth - indexBits - intraSlotIdBits - subblockOffsetBits
+      // Address layout
+      // | SuperblockTag | Index | SlotId = BlockId + SubblkId | SubblockOffset
       val offsetLSB = 0
       val offsetMSB = subblockOffsetBits - 1
       val subblkIdLSB = offsetMSB + 1
       val subblkIdMSB = subblkIdLSB + subblkIdBits - 1
-      val indexLSB = subblkIdMSB + 1
+      val blockIdLSB = subblkIdMSB + 1
+      val blockIdMSB = blockIdLSB + blockIdBits - 1
+      val slotIdLSB = subblkIdLSB
+      val slotIdMSB = blockIdMSB
+      val indexLSB = blockIdMSB + 1
       val indexMSB = indexLSB + indexBits - 1
-      val tagLSB = indexMSB + 1
-      val tagMSB = tagLSB + tagBits - 1
-      assert(tagMSB + 1 == addrWidth)
+      val superblockTagLSB = indexMSB + 1
+      val superblockTagMSB = superblockTagLSB + superblockTagBits - 1
+      assert(superblockTagMSB + 1 == addrWidth)
 
       val rst_cnt = RegInit(0.U(log2Up(2 * nSets + 1).W))
       val rst = (rst_cnt < (2 * nSets).U) && !reset.asBool
       when (rst) { rst_cnt := rst_cnt + 1.U }
 
-      val s_idle :: s_gather_write_data :: s_send_bresp :: s_update_meta :: s_tag_read :: s_merge_put_data :: s_data_read :: s_data_write :: s_wait_ram_awready :: s_do_ram_write :: s_wait_ram_bresp :: s_wait_ram_arready :: s_do_ram_read :: s_data_resp :: Nil = Enum(14)
+      val s_idle :: s_gather_write_data :: s_send_bresp :: s_update_meta :: s_tag_read :: s_merge_put_data :: s_pre_data_read :: s_data_read :: s_data_write :: s_wait_ram_awready :: s_do_ram_write :: s_wait_ram_bresp :: s_wait_ram_arready :: s_do_ram_read :: s_data_resp :: Nil = Enum(15)
 
       val state = RegInit(s_idle)
       // state transitions for each case
       // read hit: s_idle -> s_tag_read -> s_data_read -> s_data_resp -> s_idle
       // read miss no writeback : s_idle -> s_tag_read -> s_wait_ram_arready -> s_do_ram_read -> s_data_write -> s_update_meta -> s_idle
-      // read miss writeback : s_idle -> s_tag_read -> s_data_read -> s_wait_ram_awready -> s_do_ram_write -> s_wait_ram_bresp
+      // read miss writeback : s_idle -> s_tag_read -> s_pre_data_read -> s_data_read -> s_wait_ram_awready -> s_do_ram_write -> s_wait_ram_bresp
       //                              -> s_wait_ram_arready -> s_do_ram_read -> s_data_write -> s_update_meta -> s_idle
       // write hit: s_idle -> s_gather_write_data ->  s_send_bresp -> s_tag_read -> s_data_read -> s_merge_put_data -> s_data_write -> s_update_meta -> s_idle
       // write miss no writeback : s_idle -> s_gather_write_data ->  s_send_bresp -> s_tag_read -> s_wait_ram_arready -> s_do_ram_read
       //                                  -> s_merge_put_data -> s_data_write -> s_update_meta -> s_idle
-      // write miss writeback : s_idle -> s_gather_write_data ->  s_send_bresp -> s_tag_read -> s_data_read -> s_wait_ram_awready -> s_do_ram_write -> s_wait_ram_bresp
+      // write miss writeback : s_idle -> s_gather_write_data ->  s_send_bresp -> s_tag_read -> s_pre_data_read -> s_data_read -> s_wait_ram_awready -> s_do_ram_write -> s_wait_ram_bresp
       //                               -> s_wait_ram_arready -> s_do_ram_read -> s_merge_put_data -> s_data_write -> s_update_meta -> s_idle
       val timer = GTimer()
       val log_prefix = "cycle: %d [L4Cache] state %x "
@@ -231,7 +244,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         name = "L4_meta_array",
         desc = "L4 cache metadata array",
         size = nSets,
-        data = Vec(nWays, new L4MetadataEntry(tagBits, nSubblk))
+        data = Vec(nWays, new L4MetadataEntry(superblockTagBits, nSubblk, intraSlotIdBits))
       )
 
       val meta_raddr = Mux(in.ar.fire(), in_ar.addr, addr)
@@ -241,96 +254,98 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       val meta_rdata = meta_array.read(meta_ridx, !meta_array_wen)
 
       val subblkId = addr(subblkIdMSB, subblkIdLSB)
+      val blockId = addr(blockIdMSB, blockIdLSB)
+      val slotId = Cat(blockId, subblkId)
       val idx = addr(indexMSB, indexLSB)
-      val tag = addr(tagMSB, tagLSB)
+      val superblockTag = addr(superblockTagMSB, superblockTagLSB)
 
       def wayMap[T <: Data](f: Int => T) = VecInit((0 until nWays).map(f))
 
       val block_vb_rdata = wayMap((w: Int) => meta_rdata(w).valid).asUInt
-      val tag_rdata = wayMap((w: Int) => meta_rdata(w).tag)
+      val superblockTag_rdata = wayMap((w: Int) => meta_rdata(w).superblockTag)
       val subblock_vb_rdata = wayMap((w: Int) => meta_rdata(w).subblockValid)
       val subblock_db_rdata = wayMap((w: Int) => meta_rdata(w).subblockDirty)
+      val intraSlotId_rdata = wayMap((w: Int) => meta_rdata(w).intraSlotId)
 
-      val tag_eq_way = wayMap((w: Int) => tag_rdata(w) === tag)
+      val tag_eq_way = wayMap((w: Int) => superblockTag_rdata(w) === superblockTag)
       val tag_match_way = wayMap((w: Int) => tag_eq_way(w) && block_vb_rdata(w)).asUInt
       val hit_way = Wire(Bits())
       hit_way := 0.U
       (0 until nWays).foreach(i => when (tag_match_way(i)) { hit_way := i.U })
-      val block_hit = tag_match_way.orR // block hit/miss
-      val block_read_hit = block_hit && ren
-      val block_write_hit = block_hit && wen
-      val block_read_miss = !block_hit && ren
-      val block_write_miss = !block_hit && wen
-      val subblock_hit = block_hit && subblock_vb_rdata(hit_way)(subblkId) // subblk hit/miss
-      val subblock_read_hit = subblock_hit && ren // situation 1
+      val superblock_hit = tag_match_way.orR // superblock hit/miss
+      val superblock_read_miss = !superblock_hit && ren
+      val superblock_write_miss = !superblock_hit && wen
+      val subblock_hit = superblock_hit && (intraSlotId_rdata(hit_way)(subblkId) === slotId) && subblock_vb_rdata(hit_way)(subblkId) // subblk hit/miss // TODO: another tag matching
+      val subblock_read_hit = subblock_hit && ren // situation 1: superblock hit, subblock hit
       val subblock_write_hit = subblock_hit && wen // situation 2
-      val onlysubblock_read_miss = block_hit && !subblock_hit && ren // situation 3: block hit, but subblk miss
-      val onlysubblock_write_miss = block_hit && !subblock_hit && wen // situation 4
+      val subblock_read_miss_no_writeback = superblock_hit && ren && !subblock_hit && !subblock_db_rdata(hit_way)(subblkId) // situation 3: superblock hit, but subblk mismatch, no writeback
+      val subblock_write_miss_no_writeback = superblock_hit && wen && !subblock_hit && !subblock_db_rdata(hit_way)(subblkId) // situation 4
+      val subblock_read_miss_writeback = superblock_hit && ren && (intraSlotId_rdata(hit_way)(subblkId) =/= slotId) && subblock_vb_rdata(hit_way)(subblkId) && subblock_db_rdata(hit_way)(subblkId)
+      // situation 9: superblock hit, but subblk mismatch, and need writeback
+      val subblock_write_miss_writeback = superblock_hit && wen && (intraSlotId_rdata(hit_way)(subblkId) =/= slotId) && subblock_vb_rdata(hit_way)(subblkId) && subblock_db_rdata(hit_way)(subblkId)
+      // situation 10
 
       // use random replacement
-      val lfsr = LFSR(log2Ceil(nWays), state === s_update_meta && !block_hit)
-      val repl_way_enable = (state === s_idle && in.ar.fire()) || (state === s_send_bresp && in.b.fire())
-      val repl_way = RegEnable(next = if(nWays == 1) 0.U else lfsr(log2Ceil(nWays) - 1, 0),
-        init = 0.U, enable = repl_way_enable)
-      // val repl_way = 0.U
+      // val lfsr = LFSR(log2Ceil(nWays), state === s_update_meta && !superblock_hit)
+      // val repl_way_enable = (state === s_idle && in.ar.fire()) || (state === s_send_bresp && in.b.fire())
+      // val repl_way = RegEnable(next = if(nWays == 1) 0.U else lfsr(log2Ceil(nWays) - 1, 0),
+      //   init = 0.U, enable = repl_way_enable)
+      val repl_way = 0.U // TODO: enable 1-way
+      val update_way = Mux(superblock_hit, hit_way, repl_way)
 
       // valid and dirty
       // writeback in the block level
-      val need_writeback = !block_hit && subblock_db_rdata(repl_way).orR
-      // val need_writeback = !block_hit && true.B
-      val writeback_tag = tag_rdata(repl_way)
-      val wb_subblkId = RegInit(0.U((subblkIdBits).W))
-      val writeback_addr = Cat(writeback_tag, Cat(idx, Cat(wb_subblkId, 0.U(subblockOffsetBits.W))))
+      val superblock_need_writeback = !superblock_hit && subblock_db_rdata(repl_way).orR
+      // val superblock_need_writeback = !superblock_hit && true.B // TODO: try always writeback
+      val subblock_need_writeback = subblock_read_miss_writeback || subblock_write_miss_writeback
 
-      // TODO: for superblock-subblocking, no writeback unless supertag mismatch
-      val block_read_miss_writeback = block_read_miss && need_writeback // situation 5
-      val block_read_miss_no_writeback = block_read_miss && !need_writeback // situation 6
-      val block_write_miss_writeback = block_write_miss && need_writeback // situation 7
-      val block_write_miss_no_writeback = block_write_miss && !need_writeback // situation 8
+      val wb_superblockTag = Mux(superblock_need_writeback, superblockTag_rdata(repl_way), superblockTag)
+      val wb_subblkId = RegInit(0.U((subblkIdBits).W))
+      val wb_blockId = Wire(UInt(blockIdBits.W))
+      wb_blockId := Mux(superblock_need_writeback, intraSlotId_rdata(repl_way)(wb_subblkId)(subblkIdBits + blockIdBits - 1, subblkIdBits),
+                                                   intraSlotId_rdata(hit_way)(wb_subblkId)(subblkIdBits + blockIdBits - 1, subblkIdBits))
+      val wb_addr = Cat(wb_superblockTag, Cat(idx, Cat(wb_blockId, Cat(wb_subblkId, 0.U(subblockOffsetBits.W)))))
+
+      val block_read_miss_writeback = superblock_read_miss && superblock_need_writeback // situation 5
+      val block_read_miss_no_writeback = superblock_read_miss && !superblock_need_writeback // situation 6
+      val block_write_miss_writeback = superblock_write_miss && superblock_need_writeback // situation 7
+      val block_write_miss_no_writeback = superblock_write_miss && !superblock_need_writeback // situation 8
 
       val need_data_read = subblock_read_hit || subblock_write_hit || // subblk hit
-                           block_read_miss_writeback || block_write_miss_writeback // block miss, need writeback
-                            // situation 1, 2, 5, 7
-      val no_need_data_read = onlysubblock_read_miss || onlysubblock_write_miss ||
+                           block_read_miss_writeback || block_write_miss_writeback || // block miss, need writeback
+                           subblock_read_miss_writeback || subblock_write_miss_writeback // subblock miss, need writeback
+                            // situation 1, 2, 5, 7, 9, 10
+      val no_need_data_read = subblock_read_miss_no_writeback || subblock_write_miss_no_writeback ||
                               block_read_miss_no_writeback || block_write_miss_no_writeback
                             // situation: 3, 4, 6, 8
 
       when (state === s_tag_read) {
-        log("req: isread %x iswrite %x addr %x idx %d tag %x subblkId %x blkHit %d subblkHit %d hit_way %x",
+        log("req: isread %x iswrite %x addr %x idx %d superblockTag %x blockId %x subblkId %x superblockHit %d subblkHit %d hit_way %x",
             ren, wen,
             addr,
-            idx, tag, subblkId,
-            block_hit, subblock_hit, hit_way)
-        when (!block_hit) {
-          log("\tmiss repl_way %x repl_valid %x repl_subblkValid %x repl_subblkDirty %x needwb %x wbaddr %x",
-              repl_way, block_vb_rdata(repl_way), subblock_vb_rdata(repl_way), subblock_db_rdata(repl_way), need_writeback, writeback_addr)
+            idx, superblockTag, blockId, subblkId,
+            superblock_hit, subblock_hit, hit_way)
+        when (!superblock_hit) {
+          log("\tSB miss repl_way %x repl_valid %x repl_subblkValid %x repl_subblkDirty %x repl_slotId %x needwb %x wbaddr %x",
+              repl_way, block_vb_rdata(repl_way), subblock_vb_rdata(repl_way), subblock_db_rdata(repl_way), intraSlotId_rdata(repl_way).asUInt, superblock_need_writeback, wb_addr)
         } .otherwise {
-          log("\thit hit_way %x hit_valid %x hit_subblkValid %x hit_subblkDirty %x",
-              hit_way, block_vb_rdata(hit_way), subblock_vb_rdata(hit_way), subblock_db_rdata(hit_way))
+          log("\tSB hit hit_way %x hit_subblkValid %x hit_subblkDirty %x hit_slotId %x needwb %x wbaddr %x",
+              hit_way, subblock_vb_rdata(hit_way), subblock_db_rdata(hit_way), intraSlotId_rdata(hit_way).asUInt, subblock_need_writeback, wb_addr)
         }
-        // printf("[L4cache] time %d req: isread %x iswrite %x addr %x idx %d tag %x hit %d hit_way %x repl_way %x needwb %x wbaddr %x\n",
-        //     GTimer(), ren, wen,
-        //     addr,
-        //     idx,
-        //     tag,
-        //     hit, hit_way,
-        //     repl_way,
-        //     need_writeback, writeback_addr)
-        // show all tags, valid and dirty bits
-        // log("time: %d [L4Cache] s1 tags: ", GTimer())
-        // for (i <- 0 until nWays) {
-        //   log("%x ", tag_rdata(i))
-        // }
-        // log("\n")
-        // log("time: %d [L4Cache] s1 vb: %x\n", GTimer(), block_vb_rdata)
 
         // check for cross cache line bursts
         assert(inner_end_beat < innerDataBeats.U, "cross cache line bursts detected")
 
         when (need_data_read) {
-          state := s_data_read
-          when (need_writeback) {
-            log("writeback start: idx %d way %x addr %x subblkId %x ", idx, repl_way, writeback_addr, wb_subblkId)
+          // insert a cycle for wb_subblkId to ready
+          when (superblock_need_writeback) {
+            wb_subblkId := 0.U // scan from subblockId 0
+            state := s_pre_data_read
+          } .elsewhen (subblock_need_writeback) {
+            wb_subblkId := subblkId
+            state := s_pre_data_read
+          } .otherwise {
+            state := s_data_read
           }
         } .elsewhen (no_need_data_read) {
           // no need to write back, directly refill data
@@ -340,20 +355,29 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         }
       }
 
+      when (state === s_pre_data_read) {
+        state := s_data_read
+        when (superblock_need_writeback) {
+          log("super writeback start: idx %d way %x addr %x blkId %x subblkId %x ", idx, repl_way, wb_addr, wb_blockId, wb_subblkId)
+        } .elsewhen (subblock_need_writeback) {
+          log("sub writeback start: idx %d way %x addr %x blkId %x subblkId %x ", idx, hit_way, wb_addr, wb_blockId, wb_subblkId)
+        }
+      }
+
       // ###############################################################
       // #                  data array read/write                      #
       // ###############################################################
       // data array read idx and beat number are different for situation (5, 7) and (1, 2)
-      val data_read_way = Mux(block_hit, hit_way, repl_way)
+      val data_read_way = Mux(superblock_hit, hit_way, repl_way)
       // incase it overflows
       val data_read_cnt = RegInit(0.U((innerBeatIndexBits + 1).W))
       val data_read_is_last_beat = data_read_cnt === innerDataBeats.U
-      val data_read_valid = (state === s_tag_read && need_data_read) || (state === s_data_read && !data_read_is_last_beat)
-      val data_read_idx = Mux(need_writeback, (idx << (innerBeatIndexBits + subblkIdBits)) | (wb_subblkId << innerBeatIndexBits) | data_read_cnt,
+      val data_read_valid = (state === s_pre_data_read && need_data_read) || (state === s_data_read && !data_read_is_last_beat)
+      val data_read_idx = Mux(superblock_need_writeback || subblock_need_writeback, (idx << (innerBeatIndexBits + subblkIdBits)) | (wb_subblkId << innerBeatIndexBits) | data_read_cnt,
                               (idx << (innerBeatIndexBits + subblkIdBits)) | (subblkId << innerBeatIndexBits) | data_read_cnt)
       val dout = Wire(Vec(split, UInt(outerBeatSize.W)))
 
-      val data_write_way = Mux(block_hit, hit_way, repl_way)
+      val data_write_way = Mux(superblock_hit, hit_way, repl_way)
       val data_write_cnt = Wire(UInt())
       val data_write_valid = state === s_data_write
       val data_write_idx = (idx << (innerBeatIndexBits + subblkIdBits)) | (subblkId << innerBeatIndexBits) | data_write_cnt
@@ -375,9 +399,9 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         }
         dout(i) := data_array.read(data_read_idx, data_read_valid && !data_write_valid)(data_read_way)
         when (RegNext(data_read_valid, N)) {
-          val sel_subblkId = Mux(need_writeback, wb_subblkId, subblkId)
-          log("read data array: %d idx %d subblkId %d way %d wb %x cnt %d data %x\n",
-            i.U, RegNext(idx), RegNext(sel_subblkId), RegNext(data_read_way), RegNext(need_writeback), RegNext(data_read_cnt), dout(i))
+          val sel_subblkId = Mux(superblock_need_writeback || subblock_need_writeback, wb_subblkId, subblkId)
+          log("read data array: %d idx %d subblkId %d way %d super_wb %x sub_wb %x cnt %d data %x\n",
+            i.U, RegNext(idx), RegNext(sel_subblkId), RegNext(data_read_way), RegNext(superblock_need_writeback), RegNext(subblock_need_writeback), RegNext(data_read_cnt), dout(i))
         }
       }
 
@@ -395,7 +419,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
           data_read_cnt := 0.U
           when (subblock_read_hit) {
             state := s_data_resp
-          } .elsewhen (block_read_miss_writeback || block_write_miss_writeback) {
+          } .elsewhen (block_read_miss_writeback || block_write_miss_writeback || subblock_read_miss_writeback || subblock_write_miss_writeback) {
             state := s_wait_ram_awready
           } .elsewhen (subblock_write_hit) {
             state := s_merge_put_data
@@ -435,16 +459,16 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       }
 
       // s_update_meta
-      val update_way = Mux(block_hit, hit_way, repl_way)
-      val update_metadata = Wire(Vec(nWays, new L4MetadataEntry(tagBits, nSubblk)))
-      val rst_metadata = Wire(Vec(nWays, new L4MetadataEntry(tagBits, nSubblk)))
+      val update_metadata = Wire(Vec(nWays, new L4MetadataEntry(superblockTagBits, nSubblk, intraSlotIdBits)))
+      val rst_metadata = Wire(Vec(nWays, new L4MetadataEntry(superblockTagBits, nSubblk, intraSlotIdBits)))
 
       for (i <- 0 until nWays) {
         val metadata = rst_metadata(i)
         metadata.valid := false.B
-        metadata.tag := 0.U
+        metadata.superblockTag := 0.U
         metadata.subblockValid := 0.U(nSubblk.W)
         metadata.subblockDirty := 0.U(nSubblk.W)
+        metadata.intraSlotId := VecInit(Seq.fill(nSubblk) { 0.U(intraSlotIdBits.W) })
       }
 
       for (i <- 0 until nWays) {
@@ -452,16 +476,20 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         val is_update_way = update_way === i.U
         when (is_update_way) {
           metadata.valid := true.B
-          metadata.tag := tag
-          metadata.subblockValid := Mux(block_hit, subblock_vb_rdata(i) | (1.U << subblkId),
+          metadata.superblockTag := superblockTag
+          metadata.subblockValid := Mux(superblock_hit, subblock_vb_rdata(i) | (1.U << subblkId),
                                     1.U << subblkId)
-          metadata.subblockDirty := Mux(block_hit, subblock_db_rdata(i) | (wen << subblkId),
-                                    (wen << subblkId))
+          metadata.subblockDirty := Mux(superblock_hit, subblock_db_rdata(i) | (wen << subblkId),
+                                    (wen << subblkId)) // TODO: more saving dirty policy
+          val reset_intraSlotId = VecInit(Seq.fill(nSubblk) { 0.U(intraSlotIdBits.W) })
+          metadata.intraSlotId   := Mux(superblock_hit, intraSlotId_rdata(i), reset_intraSlotId)
+          metadata.intraSlotId(subblkId) := slotId
         } .otherwise {
           metadata.valid := block_vb_rdata(i)
-          metadata.tag := tag_rdata(i)
+          metadata.superblockTag := superblockTag_rdata(i)
           metadata.subblockValid := subblock_vb_rdata(i)
           metadata.subblockDirty := subblock_db_rdata(i)
+          metadata.intraSlotId := intraSlotId_rdata(i)
         }
       }
 
@@ -470,9 +498,9 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 
       when (meta_array_wen) {
         meta_array.write(meta_array_widx, meta_array_wdata)
-        when (!block_hit && !rst) {
-          assert(update_way === repl_way, "update must = repl way when cache miss")
-          log("update_tag: idx %d tag %x valid %x subValid %x subDirty %x repl_way %d\n", idx, update_metadata(update_way).tag, update_metadata(update_way).valid, update_metadata(update_way).subblockValid, update_metadata(update_way).subblockDirty, repl_way)
+        when (!rst) {
+          log("update_meta: idx %d superblockTag %x valid %x subValid %x subDirty %x intraSlotId %x update_way %d\n",
+              idx, update_metadata(update_way).superblockTag, update_metadata(update_way).valid, update_metadata(update_way).subblockValid, update_metadata(update_way).subblockDirty, update_metadata(update_way).intraSlotId.asUInt, update_way)
         }
       }
 
@@ -489,7 +517,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       // external memory bus width is 32/64/128bits
       // so each memport read/write is mapped into a whole axi bus width read/write
       val axi4_size = log2Up(outerBeatBytes).U
-      val mem_addr = Cat(addr(tagMSB, subblkIdLSB), 0.asUInt(subblockOffsetBits.W))
+      val mem_addr = Cat(addr(superblockTagMSB, subblkIdLSB), 0.asUInt(subblockOffsetBits.W))
 
       // #########################################################
       // #                  write back path                      #
@@ -504,7 +532,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         state := s_wait_ram_bresp
       }
       when (state === s_do_ram_write && out.w.fire()) {
-        log("data_writeback: idx %d tag %x mem_addr %x cnt %x wb_done %x wbSubId %x subValid %x subDirty %x wb_strb %x wb_data %x\n", idx, writeback_tag, writeback_addr, wb_cnt, wb_done, wb_subblkId, subblock_vb_rdata(repl_way), subblock_db_rdata(repl_way), out_w.strb, out_w.data)
+        log("data_writeback: idx %d superblockTag %x mem_addr %x cnt %x wb_done %x wbBlkId %x wbSubId %x subValid %x subDirty %x wb_strb %x wb_data %x\n", idx, wb_superblockTag, wb_addr, wb_cnt, wb_done, wb_blockId, wb_subblkId, subblock_vb_rdata(update_way), subblock_db_rdata(update_way), out_w.strb, out_w.data)
       }
       when (!reset.asBool && out.w.fire()) {
         bothHotOrNoneHot(wb_done, out_w.last, "L4 write back error")
@@ -512,7 +540,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 
       // write address channel signals
       out_aw.id := 0.U(outerIdWidth.W)
-      out_aw.addr := writeback_addr
+      out_aw.addr := wb_addr
       out_aw.len := (outerSubblkBeats - 1).U(8.W)
       out_aw.size := axi4_size
       out_aw.burst := "b01".U       // normal sequential memory
@@ -527,7 +555,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       // write data channel signals
       //out_w.id := 0.U(outerIdWidth.W)
       out_w.data := data_buf(wb_cnt)
-      val out_w_strb = Mux(subblock_db_rdata(repl_way)(wb_subblkId), Fill(outerBeatBytes, 1.U(1.W)),
+      val out_w_strb = Mux(subblock_db_rdata(update_way)(wb_subblkId), Fill(outerBeatBytes, 1.U(1.W)),
                             Fill(outerBeatBytes, 0.U(1.W))) // no-op for invalid lines
       out_w.strb := out_w_strb
       out_w.last := wb_cnt === (outerSubblkBeats - 1).U
@@ -540,13 +568,17 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
             // do refill
             state := s_wait_ram_arready
             wb_subblkId := 0.U
-            log("writeback complete: idx %d way %x addr %x subblkId %d ", idx, repl_way, writeback_addr, wb_subblkId)
+            log("super writeback all complete: idx %d way %x addr %x subblkId %d ", idx, repl_way, wb_addr, wb_subblkId)
           } .otherwise {
-            log("writeback done for idx %d way %x addr %x subblkId %d ", idx, repl_way, writeback_addr, wb_subblkId)
+            log("super writeback done one for idx %d way %x addr %x subblkId %d ", idx, repl_way, wb_addr, wb_subblkId)
             state := s_data_read
             wb_subblkId := wb_subblkId + 1.U
             assert(wb_subblkId <= nSubblk.U)
           }
+        } .elsewhen (subblock_need_writeback) {
+          // do refill
+          state := s_wait_ram_arready
+          log("sub writeback complete: idx %d way %x addr %x subblkId %d ", idx, hit_way, wb_addr, wb_subblkId)
         } .otherwise {
           assert(N, "Unexpected condition in s_wait_ram_bresp")
         }
@@ -571,7 +603,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
             state := s_merge_put_data
           }
         }
-        log("data_refill: idx %d tag %x subblkId %x mem_addr %x cnt %x refill_data %x\n", idx, tag, subblkId, mem_addr, refill_cnt, out_r.data)
+        log("data_refill: idx %d superblockTag %x blockId %x subblkId %x mem_addr %x cnt %x refill_data %x\n", idx, superblockTag, blockId, subblkId, mem_addr, refill_cnt, out_r.data)
         bothHotOrNoneHot(refill_done, out_r.last, "L4 refill error")
       }
 
@@ -606,7 +638,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         when (resp_last_beat) {
           state := s_idle
         }
-        log("data_resp: idx %d tag %x subblkId %x req_addr %x cnt %x resp_data %x\n", idx, tag, subblkId, addr, resp_curr_beat, resp_data.asUInt)
+        log("data_resp: idx %d superblockTag %x blockId %x subblkId %x req_addr %x cnt %x resp_data %x\n", idx, superblockTag, blockId, subblkId, addr, resp_curr_beat, resp_data.asUInt)
       }
 
       in_r.id := id
@@ -619,7 +651,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       // Stat counters
       L4PerfAccumulator("l4_req", state === s_tag_read) // tag_read lasts one cycle per request
       L4PerfAccumulator("l4_req_hit", state === s_tag_read && subblock_hit)
-      L4PerfAccumulator("l4_req_block_hit", state === s_tag_read && block_hit)
+      L4PerfAccumulator("l4_req_superblock_hit", state === s_tag_read && superblock_hit)
     }
   }
 }
