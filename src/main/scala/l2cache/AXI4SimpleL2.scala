@@ -27,10 +27,10 @@ class L4MetadataEntry(superblockTagBits: Int, nSubblk: Int, intraSlotIdBits: Int
 // 1. powerful stats (show all counters [nHit, nAccess] for every 10K cycles)
 // 2. [Done] integrate tag, vb, and db into MetaEntry
 // 3. [Done] Support large block size (and validate)
-// 4. [Done] Add sub-blocking into MetaEntry.
+// 4. [Done] Add sub-blocking into MetaEntry. (Level-1 style)
 // 5. [Done] Add per-block dirty information.
-// 6. Per-block sub-blocking
-// 6. Per-superblock tag and sub-blocking
+// 6. [Done] Level-2 style sub-blocking
+// 6. Level-3 Per-superblock tag and sub-blocking
 // 7. Zero-leading compression
 // 8. FPC/BDI compression
 
@@ -286,11 +286,11 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       // situation 10
 
       // use random replacement
-      // val lfsr = LFSR(log2Ceil(nWays), state === s_update_meta && !superblock_hit)
-      // val repl_way_enable = (state === s_idle && in.ar.fire()) || (state === s_send_bresp && in.b.fire())
-      // val repl_way = RegEnable(next = if(nWays == 1) 0.U else lfsr(log2Ceil(nWays) - 1, 0),
-      //   init = 0.U, enable = repl_way_enable)
-      val repl_way = 0.U // TODO: enable 1-way
+      val lfsr = LFSR(log2Ceil(nWays), state === s_update_meta && !superblock_hit)
+      val repl_way_enable = (state === s_idle && in.ar.fire()) || (state === s_send_bresp && in.b.fire())
+      val repl_way = RegEnable(next = if(nWays == 1) 0.U else lfsr(log2Ceil(nWays) - 1, 0),
+        init = 0.U, enable = repl_way_enable)
+      // val repl_way = 0.U // TODO: enable 1-way
       val update_way = Mux(superblock_hit, hit_way, repl_way)
 
       // valid and dirty
