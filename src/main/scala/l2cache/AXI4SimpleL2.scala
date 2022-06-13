@@ -14,25 +14,28 @@ case object NL4CacheCapacity extends Field[Int](4096)
 case object NL4CacheWays extends Field[Int](16)
 case object NL4BanksPerMemChannel extends Field[Int](4)
 
-class L4MetadataEntry(superblockTagBits: Int, nSubblk: Int, intraSlotIdBits: Int) extends Bundle {
+class L4MetadataEntry(superblockTagBits: Int, nSubblk: Int, intraSlotIdBits: Int, intraSlotLenBits: Int) extends Bundle {
   val valid = Bool()
   val superblockTag = UInt(width = superblockTagBits.W)
   val subblockValid = UInt(width = nSubblk.W)
   val subblockDirty = UInt(width = nSubblk.W)
   val intraSlotId = Vec(nSubblk, UInt(intraSlotIdBits.W))
+  val intraSlotLen = Vec(nSubblk, UInt(intraSlotLenBits.W))
 }
 
 // ============================== DCache ==============================
 // TODO list:
-// 1. powerful stats (show all counters [nHit, nAccess] for every 10K cycles)
+// 1. [Done] powerful stats (show all counters [nHit, nAccess] for every 10K cycles)
 // 2. [Done] integrate tag, vb, and db into MetaEntry
 // 3. [Done] Support large block size (and validate)
 // 4. [Done] Add sub-blocking into MetaEntry. (Level-1 style)
 // 5. [Done] Add per-block dirty information.
 // 6. [Done] Level-2 style sub-blocking
 // 7. [Done] Level-3 Per-superblock tag and sub-blocking
-// 8. Zero-leading compression
+// 8. [Dev] Zero-leading compression (compress when superblock miss)
+// 9. Compress when sub-block miss
 // 9. FPC/BDI compression
+// 10. Baryon's succient metadata format
 
 class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 {
@@ -45,6 +48,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
     val blockSize = subblockSize * nSubblk
     val superblockSize = blockSize * nBlockPerSuperblock
     val nIntraSlot = superblockSize / subblockSize
+    val maxCF = 4
     val nWays = p(NL4CacheWays)
     val nSets = p(NL4CacheCapacity) / blockSize / nWays
     (node.in zip node.out) foreach { case ((in, edgeIn), (out, edgeOut)) =>
@@ -95,6 +99,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       val subblkIdBits = log2Ceil(nSubblk)
       val blockIdBits = log2Ceil(nBlockPerSuperblock)
       val intraSlotIdBits = log2Ceil(nIntraSlot)
+      val intraSlotLenBits = log2Ceil(maxCF)
       assert(intraSlotIdBits == subblkIdBits + blockIdBits)
       assert(subblkIdBits > 0)
       val superblockTagBits = addrWidth - indexBits - intraSlotIdBits - subblockOffsetBits
@@ -244,7 +249,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         name = "L4_meta_array",
         desc = "L4 cache metadata array",
         size = nSets,
-        data = Vec(nWays, new L4MetadataEntry(superblockTagBits, nSubblk, intraSlotIdBits))
+        data = Vec(nWays, new L4MetadataEntry(superblockTagBits, nSubblk, intraSlotIdBits, intraSlotLenBits))
       )
 
       val meta_raddr = Mux(in.ar.fire(), in_ar.addr, addr)
@@ -256,6 +261,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       val subblkId = addr(subblkIdMSB, subblkIdLSB)
       val blockId = addr(blockIdMSB, blockIdLSB)
       val slotId = Cat(blockId, subblkId)
+      val slotLen = 1.U(intraSlotLenBits.W) // TODO: always 1-slot size
       val idx = addr(indexMSB, indexLSB)
       val superblockTag = addr(superblockTagMSB, superblockTagLSB)
 
@@ -267,6 +273,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       val subblock_vb_rdata = wayMap((w: Int) => meta_rdata(w).subblockValid)
       val subblock_db_rdata = wayMap((w: Int) => meta_rdata(w).subblockDirty)
       val intraSlotId_rdata = wayMap((w: Int) => meta_rdata(w).intraSlotId)
+      val intraSlotLen_rdata = wayMap((w: Int) => meta_rdata(w).intraSlotLen)
 
       val tag_eq_way = wayMap((w: Int) => superblockTag_rdata(w) === superblockTag)
       val tag_match_way = wayMap((w: Int) => tag_eq_way(w) && block_vb_rdata(w)).asUInt
@@ -277,7 +284,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       val superblock_read_miss = !superblock_hit && ren
       val superblock_write_miss = !superblock_hit && wen
 
-      val slot_eq_subblk = subblkMap((w: Int) => intraSlotId_rdata(hit_way)(w) === slotId)
+      val slot_eq_subblk = subblkMap((w: Int) => (intraSlotId_rdata(hit_way)(w) <= slotId) && (intraSlotId_rdata(hit_way)(w) + intraSlotLen_rdata(hit_way)(w) > slotId))
       val slot_match_subblk = subblkMap((w: Int) => slot_eq_subblk(w) && subblock_vb_rdata(hit_way)(w)).asUInt
       val hit_slot = Wire(UInt(subblkIdBits.W))
       hit_slot := 0.U
@@ -482,8 +489,8 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       }
 
       // s_update_meta
-      val update_metadata = Wire(Vec(nWays, new L4MetadataEntry(superblockTagBits, nSubblk, intraSlotIdBits)))
-      val rst_metadata = Wire(Vec(nWays, new L4MetadataEntry(superblockTagBits, nSubblk, intraSlotIdBits)))
+      val update_metadata = Wire(Vec(nWays, new L4MetadataEntry(superblockTagBits, nSubblk, intraSlotIdBits, intraSlotLenBits)))
+      val rst_metadata = Wire(Vec(nWays, new L4MetadataEntry(superblockTagBits, nSubblk, intraSlotIdBits, intraSlotLenBits)))
 
       for (i <- 0 until nWays) {
         val metadata = rst_metadata(i)
@@ -492,6 +499,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         metadata.subblockValid := 0.U(nSubblk.W)
         metadata.subblockDirty := 0.U(nSubblk.W)
         metadata.intraSlotId := VecInit(Seq.fill(nSubblk) { 0.U(intraSlotIdBits.W) })
+        metadata.intraSlotLen := VecInit(Seq.fill(nSubblk) { 0.U(intraSlotLenBits.W) })
       }
 
       for (i <- 0 until nWays) {
@@ -504,15 +512,19 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
                                     1.U << update_slot)
           metadata.subblockDirty := Mux(superblock_hit, subblock_db_rdata(i) | (wen << update_slot),
                                     (wen << update_slot)) // TODO: more saving dirty policy
-          val reset_intraSlotId = VecInit(Seq.fill(nSubblk) { 0.U(intraSlotIdBits.W) })
+          val reset_intraSlotId  = VecInit(Seq.fill(nSubblk) { 0.U(intraSlotIdBits.W) })
           metadata.intraSlotId   := Mux(superblock_hit, intraSlotId_rdata(i), reset_intraSlotId)
           metadata.intraSlotId(update_slot) := slotId
+          val reset_intraSlotLen = VecInit(Seq.fill(nSubblk) { 0.U(intraSlotLenBits.W) })
+          metadata.intraSlotLen  := Mux(superblock_hit, intraSlotLen_rdata(i), reset_intraSlotLen)
+          metadata.intraSlotLen(update_slot) := slotLen
         } .otherwise {
           metadata.valid := block_vb_rdata(i)
           metadata.superblockTag := superblockTag_rdata(i)
           metadata.subblockValid := subblock_vb_rdata(i)
           metadata.subblockDirty := subblock_db_rdata(i)
-          metadata.intraSlotId := intraSlotId_rdata(i)
+          metadata.intraSlotId   := intraSlotId_rdata(i)
+          metadata.intraSlotLen  := intraSlotLen_rdata(i)
         }
       }
 
