@@ -30,9 +30,9 @@ class L4MetadataEntry(superblockTagBits: Int, nSubblk: Int, intraSlotIdBits: Int
 // 4. [Done] Add sub-blocking into MetaEntry. (Level-1 style)
 // 5. [Done] Add per-block dirty information.
 // 6. [Done] Level-2 style sub-blocking
-// 6. [Done] Level-3 Per-superblock tag and sub-blocking
-// 7. Zero-leading compression
-// 8. FPC/BDI compression
+// 7. [Done] Level-3 Per-superblock tag and sub-blocking
+// 8. Zero-leading compression
+// 9. FPC/BDI compression
 
 class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 {
@@ -285,9 +285,12 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       val subblock_hit = superblock_hit && slot_match_subblk.orR
       val subblock_miss = superblock_hit && !slot_match_subblk.orR
 
-      val repl_slot = 0.U // TODO: always repl slot-0
+      val repl_slot_lfsr = LFSR(log2Ceil(nSubblk) + 1, state === s_update_meta && !subblock_hit)
+      val repl_slot_enable = (state === s_idle && in.ar.fire()) || (state === s_send_bresp && in.b.fire())
+      val repl_slot = RegEnable(next = if(nSubblk == 1) 0.U else (repl_slot_lfsr(log2Ceil(nSubblk) - 1, 0) % nSubblk.U), // TODO: remove mod()
+        init = 0.U, enable = repl_slot_enable)
+      // val repl_slot = 0.U // TODO: always repl slot-0
       val update_slot = Mux(subblock_hit, hit_slot, repl_slot)
-      assert(update_slot === 0.U) // TODO: always update subblk-0
 
       val subblock_read_hit = subblock_hit && ren // situation 1: superblock hit, subblock hit
       val subblock_write_hit = subblock_hit && wen // situation 2
@@ -299,11 +302,11 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       // situation 10
 
       // use random replacement
-      // val lfsr = LFSR(log2Ceil(nWays), state === s_update_meta && !superblock_hit)
-      // val repl_way_enable = (state === s_idle && in.ar.fire()) || (state === s_send_bresp && in.b.fire())
-      // val repl_way = RegEnable(next = if(nWays == 1) 0.U else lfsr(log2Ceil(nWays) - 1, 0),
-      //   init = 0.U, enable = repl_way_enable)
-      val repl_way = 0.U // TODO: enable 1-way
+      val repl_way_lfsr = LFSR(log2Ceil(nWays), state === s_update_meta && !superblock_hit)
+      val repl_way_enable = (state === s_idle && in.ar.fire()) || (state === s_send_bresp && in.b.fire())
+      val repl_way = RegEnable(next = if(nWays == 1) 0.U else repl_way_lfsr(log2Ceil(nWays) - 1, 0),
+        init = 0.U, enable = repl_way_enable)
+      // val repl_way = 0.U // TODO: enable 1-way
       val update_way = Mux(superblock_hit, hit_way, repl_way)
 
       // valid and dirty
@@ -316,10 +319,10 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       val wb_subblkId = Wire(UInt(subblkIdBits.W))
       val wb_blockId = Wire(UInt(blockIdBits.W))
       val wb_slotId = RegInit(0.U((subblkIdBits).W))
-      wb_blockId := Mux(superblock_need_writeback, intraSlotId_rdata(repl_way)(repl_slot)(subblkIdBits + blockIdBits - 1, subblkIdBits),
-                                                   intraSlotId_rdata(hit_way)(repl_slot)(subblkIdBits + blockIdBits - 1, subblkIdBits))
-      wb_subblkId := Mux(superblock_need_writeback, intraSlotId_rdata(repl_way)(repl_slot)(blockIdBits - 1, 0),
-                                                   intraSlotId_rdata(hit_way)(repl_slot)(blockIdBits - 1, 0))
+      wb_blockId := Mux(superblock_need_writeback, intraSlotId_rdata(repl_way)(wb_slotId)(subblkIdBits + blockIdBits - 1, subblkIdBits),
+                                                   intraSlotId_rdata(hit_way)(wb_slotId)(subblkIdBits + blockIdBits - 1, subblkIdBits))
+      wb_subblkId := Mux(superblock_need_writeback, intraSlotId_rdata(repl_way)(wb_slotId)(blockIdBits - 1, 0),
+                                                   intraSlotId_rdata(hit_way)(wb_slotId)(blockIdBits - 1, 0))
       val wb_addr = Cat(wb_superblockTag, Cat(idx, Cat(wb_blockId, Cat(wb_subblkId, 0.U(subblockOffsetBits.W)))))
 
       val block_read_miss_writeback = superblock_read_miss && superblock_need_writeback // situation 5
@@ -391,7 +394,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       val data_read_cnt = RegInit(0.U((innerBeatIndexBits + 1).W))
       val data_read_is_last_beat = data_read_cnt === innerDataBeats.U
       val data_read_valid = (state === s_pre_data_read && need_data_read) || (state === s_data_read && !data_read_is_last_beat)
-      val data_read_idx = Mux(superblock_need_writeback || subblock_need_writeback, (idx << (innerBeatIndexBits + subblkIdBits)) | (repl_slot << innerBeatIndexBits) | data_read_cnt,
+      val data_read_idx = Mux(superblock_need_writeback || subblock_need_writeback, (idx << (innerBeatIndexBits + subblkIdBits)) | (wb_slotId << innerBeatIndexBits) | data_read_cnt,
                               (idx << (innerBeatIndexBits + subblkIdBits)) | (hit_slot << innerBeatIndexBits) | data_read_cnt)
       val dout = Wire(Vec(split, UInt(outerBeatSize.W)))
 
@@ -419,7 +422,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         }
         dout(i) := data_array.read(data_read_idx, data_read_valid && !data_write_valid)(data_read_way)
         when (RegNext(data_read_valid, N)) {
-          val sel_slotId = Mux(superblock_need_writeback || subblock_need_writeback, repl_slot, hit_slot)
+          val sel_slotId = Mux(superblock_need_writeback || subblock_need_writeback, wb_slotId, hit_slot)
           log("read data array: %d idx %d slotId %d way %d super_wb %x sub_wb %x cnt %d data %x\n",
             i.U, RegNext(idx), RegNext(sel_slotId), RegNext(data_read_way), RegNext(superblock_need_writeback), RegNext(subblock_need_writeback), RegNext(data_read_cnt), dout(i))
         }
