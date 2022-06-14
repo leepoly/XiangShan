@@ -23,6 +23,63 @@ class L4MetadataEntry(superblockTagBits: Int, nSubblk: Int, intraSlotIdBits: Int
   val intraSlotLen = Vec(nSubblk, UInt(intraSlotLenBits.W))
 }
 
+class ZeroLeadingCompressor(outerSubblkBeats: Int, outerBeatSize: Int, intraSlotLenBits: Int) extends Module
+{
+  val io = IO(new Bundle() {
+    val data = Input(Vec(outerSubblkBeats, UInt(outerBeatSize.W)))
+    val data_lastbeat = Input(UInt(outerBeatSize.W)) // last beat data not stored to put_data Reg yet
+    val first_line = Input(Bool())
+    val last_line = Input(Bool())
+    val line_ready = Input(Bool())
+    val comp_len = Output(Bool())
+    val comp_data = Output(Vec(outerSubblkBeats, UInt(outerBeatSize.W)))
+  })
+
+  val input_data = Wire(Vec(outerSubblkBeats, UInt(outerBeatSize.W)))
+  (0 until outerSubblkBeats - 1).map((w: Int) => input_data(w) := io.data(w))
+  input_data(outerSubblkBeats - 1) := io.data_lastbeat
+
+  val comp_cnt = RegInit(1.U(intraSlotLenBits.W))
+  val data_beat_or = VecInit((0 until outerSubblkBeats).map((w: Int) => input_data(w).orR))
+  val data_or = RegInit(false.B)
+  val first_line_data = Reg(Vec(outerSubblkBeats, UInt(outerBeatSize.W)))
+  when (io.line_ready) {
+    data_or := data_or | data_beat_or.orR | true.B // TODO: always no compress
+    // data_or := data_or | data_beat_or.orR
+    when (!(data_or | data_beat_or.orR)) {
+      comp_cnt := comp_cnt + 1.U
+    }
+    when (io.first_line) {
+      // first_line_data := input_data
+      (0 until outerSubblkBeats).map((w: Int) => first_line_data(w) := input_data(w))
+    }
+    printf("[Compressor] first_line %x data_beat_or %x data_or %x comp_cnt %x\n", io.first_line, data_beat_or.asUInt, data_or, comp_cnt)
+    when (io.last_line) {
+      comp_cnt := 1.U
+      data_or := false.B
+    }
+    (0 until outerSubblkBeats).map((w: Int) => {
+    printf("[Compressor] comp_data cnt %x input_data %x first_line_data %x\n", w.U, input_data(w), first_line_data(w))
+    })
+  }
+  io.comp_len := comp_cnt
+  io.comp_data := first_line_data // if compressible, output first_line_data (all zero), otherwise output first_line_data
+}
+
+class ZeroLeadingDecompressor(outerSubblkBeats: Int, outerBeatSize: Int, intraSlotLenBits: Int) extends Module
+{
+  val io = IO(new Bundle() {
+    val comp_data = Input(Vec(outerSubblkBeats, UInt(outerBeatSize.W)))
+    val offset = Input(UInt(intraSlotLenBits.W))
+    val comp_slotLen = Input(UInt(intraSlotLenBits.W))
+    val ready = Input(Bool())
+    val decomp_data = Output(Vec(outerSubblkBeats, UInt(outerBeatSize.W)))
+  })
+
+  val empty_data = VecInit(Seq.fill(outerSubblkBeats) { 0.U(outerBeatSize.W) })
+  io.decomp_data := Mux(io.comp_slotLen === 1.U, io.comp_data, empty_data)
+}
+
 // ============================== DCache ==============================
 // TODO list:
 // 1. [Done] powerful stats (show all counters [nHit, nAccess] for every 10K cycles)
@@ -33,9 +90,11 @@ class L4MetadataEntry(superblockTagBits: Int, nSubblk: Int, intraSlotIdBits: Int
 // 6. [Done] Level-2 style sub-blocking
 // 7. [Done] Level-3 Per-superblock tag and sub-blocking
 // 8. [Dev] Zero-leading compression (compress when superblock miss)
-// 9. Compress when sub-block miss
+// 9. Compress when sub-block miss, read/write hit, etc.
 // 9. FPC/BDI compression
 // 10. Baryon's succient metadata format
+// 11. Software: Linux with arbitrary programs, Linux with stdin, etc.
+// 12. Emulate L4 cache latency and bandwidth
 
 class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 {
@@ -48,7 +107,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
     val blockSize = subblockSize * nSubblk
     val superblockSize = blockSize * nBlockPerSuperblock
     val nIntraSlot = superblockSize / subblockSize
-    val maxCF = 4
+    val maxCF = 2
     val nWays = p(NL4CacheWays)
     val nSets = p(NL4CacheCapacity) / blockSize / nWays
     (node.in zip node.out) foreach { case ((in, edgeIn), (out, edgeOut)) =>
@@ -99,7 +158,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       val subblkIdBits = log2Ceil(nSubblk)
       val blockIdBits = log2Ceil(nBlockPerSuperblock)
       val intraSlotIdBits = log2Ceil(nIntraSlot)
-      val intraSlotLenBits = log2Ceil(maxCF)
+      val intraSlotLenBits = log2Ceil(maxCF) + 1 // range from 1 to maxCF
       assert(intraSlotIdBits == subblkIdBits + blockIdBits)
       assert(subblkIdBits > 0)
       val superblockTagBits = addrWidth - indexBits - intraSlotIdBits - subblockOffsetBits
@@ -309,11 +368,11 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       // situation 10
 
       // use random replacement
-      val repl_way_lfsr = LFSR(log2Ceil(nWays), state === s_update_meta && !superblock_hit)
-      val repl_way_enable = (state === s_idle && in.ar.fire()) || (state === s_send_bresp && in.b.fire())
-      val repl_way = RegEnable(next = if(nWays == 1) 0.U else repl_way_lfsr(log2Ceil(nWays) - 1, 0),
-        init = 0.U, enable = repl_way_enable)
-      // val repl_way = 0.U // TODO: enable 1-way
+      // val repl_way_lfsr = LFSR(log2Ceil(nWays), state === s_update_meta && !superblock_hit)
+      // val repl_way_enable = (state === s_idle && in.ar.fire()) || (state === s_send_bresp && in.b.fire())
+      // val repl_way = RegEnable(next = if(nWays == 1) 0.U else repl_way_lfsr(log2Ceil(nWays) - 1, 0),
+        // init = 0.U, enable = repl_way_enable)
+      val repl_way = 0.U // TODO: enable 1-way
       val update_way = Mux(superblock_hit, hit_way, repl_way)
 
       // valid and dirty
@@ -344,6 +403,24 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       val no_need_data_read = subblock_read_miss_no_writeback || subblock_write_miss_no_writeback ||
                               block_read_miss_no_writeback || block_write_miss_no_writeback
                             // situation: 3, 4, 6, 8
+
+      val data_buf = Reg(Vec(outerSubblkBeats, UInt(outerBeatSize.W)))
+
+      val comp_en = block_read_miss_no_writeback // TODO: only support situation 6
+      val refill_done_decl = Wire(Bool()) // forward declare refill_done
+      val (prefetch_cnt, prefetch_done) = Counter(refill_done_decl, maxCF)
+      val rf_slotId = slotId + prefetch_cnt
+      val rf_subblkId = rf_slotId(subblkIdBits - 1, 0)
+      val rf_blockId = rf_slotId(subblkIdBits + blockIdBits - 1, subblkIdBits)
+      val rf_addr = Cat(superblockTag, Cat(idx, Cat(rf_blockId, Cat(rf_subblkId, 0.U(subblockOffsetBits.W)))))
+      val compressor = Module(new ZeroLeadingCompressor(outerSubblkBeats, outerBeatSize, intraSlotLenBits))
+      compressor.io.data := data_buf
+      compressor.io.data_lastbeat := out_r.data
+      compressor.io.first_line := prefetch_cnt === 0.U
+      compressor.io.last_line  := prefetch_done
+      compressor.io.line_ready := refill_done_decl
+      val comp_data_buf = compressor.io.comp_data
+      val comp_slotLen = compressor.io.comp_len // TODO: if slotId == 0x11, slotLen <= 1
 
       when (state === s_tag_read) {
         log("req: isread %x iswrite %x addr %x idx %d superblockTag %x blockId %x subblkId %x superblockHit %d subblkHit %d hit_way %x",
@@ -404,6 +481,12 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       val data_read_idx = Mux(superblock_need_writeback || subblock_need_writeback, (idx << (innerBeatIndexBits + subblkIdBits)) | (wb_slotId << innerBeatIndexBits) | data_read_cnt,
                               (idx << (innerBeatIndexBits + subblkIdBits)) | (hit_slot << innerBeatIndexBits) | data_read_cnt)
       val dout = Wire(Vec(split, UInt(outerBeatSize.W)))
+      val decompressor = Module(new ZeroLeadingDecompressor(outerSubblkBeats, outerBeatSize, intraSlotLenBits))
+      decompressor.io.comp_data := data_buf
+      decompressor.io.comp_slotLen := slotLen
+      decompressor.io.offset := slotId - intraSlotId_rdata(hit_way)(hit_slot)
+      decompressor.io.ready := data_read_is_last_beat
+      val decomp_data_buf = decompressor.io.decomp_data
 
       val data_write_way = Mux(superblock_hit, hit_way, repl_way)
       val data_write_cnt = Wire(UInt())
@@ -437,7 +520,6 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 
       // s_data_read
       // read miss or need write back
-      val data_buf = Reg(Vec(outerSubblkBeats, UInt(outerBeatSize.W)))
       when (data_read_valid) {
         data_read_cnt := data_read_cnt + 1.U
       }
@@ -446,6 +528,10 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
           data_buf(((data_read_cnt - 1.U) << splitBits) + i.U) := dout(i)
         }
         when (data_read_is_last_beat) {
+          when (slotLen > 1.U) {
+            // data_buf := decomp_data_buf
+            (0 until outerSubblkBeats).map((w: Int) => data_buf(w) := decomp_data_buf(w))
+          }
           data_read_cnt := 0.U
           when (subblock_read_hit) {
             state := s_data_resp
@@ -517,7 +603,9 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
           metadata.intraSlotId(update_slot) := slotId
           val reset_intraSlotLen = VecInit(Seq.fill(nSubblk) { 0.U(intraSlotLenBits.W) })
           metadata.intraSlotLen  := Mux(superblock_hit, intraSlotLen_rdata(i), reset_intraSlotLen)
-          metadata.intraSlotLen(update_slot) := slotLen
+          when (!subblock_hit) { // TODO: why this condition? I forget
+            metadata.intraSlotLen(update_slot) := Mux(comp_en, comp_slotLen, 1.U)
+          }
         } .otherwise {
           metadata.valid := block_vb_rdata(i)
           metadata.superblockTag := superblockTag_rdata(i)
@@ -534,9 +622,12 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       when (meta_array_wen) {
         meta_array.write(meta_array_widx, meta_array_wdata)
         when (!rst) {
-          log("update_meta: idx %d superblockTag %x valid %x subValid %x subDirty %x intraSlotId %x update_way %d update_slot %d\n",
-              idx, update_metadata(update_way).superblockTag, update_metadata(update_way).valid, update_metadata(update_way).subblockValid, update_metadata(update_way).subblockDirty, update_metadata(update_way).intraSlotId.asUInt,
+          log("update_meta: idx %d superblockTag %x valid %x subValid %x subDirty %x intraSlotId %x intraSlotLen %x update_way %d update_slot %d\n",
+              idx, update_metadata(update_way).superblockTag, update_metadata(update_way).valid,
+              update_metadata(update_way).subblockValid, update_metadata(update_way).subblockDirty,
+              update_metadata(update_way).intraSlotId.asUInt, update_metadata(update_way).intraSlotLen.asUInt,
               update_way, update_slot)
+          log("update_meta1: comp_en %x comp_slotLen %x", comp_en, comp_slotLen)
         }
       }
 
@@ -553,7 +644,6 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
       // external memory bus width is 32/64/128bits
       // so each memport read/write is mapped into a whole axi bus width read/write
       val axi4_size = log2Up(outerBeatBytes).U
-      val mem_addr = Cat(addr(superblockTagMSB, subblkIdLSB), 0.asUInt(subblockOffsetBits.W))
 
       // #########################################################
       // #                  write back path                      #
@@ -630,22 +720,33 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
         state := s_do_ram_read
       }
       val (refill_cnt, refill_done) = Counter(out.r.fire() && state === s_do_ram_read, outerSubblkBeats)
+      refill_done_decl := refill_done
       when (state === s_do_ram_read && out.r.fire()) {
         data_buf(refill_cnt) := out_r.data
+        log("data_refill: idx %d superblockTag %x blockId %x subblkId %x rf_addr %x rf_cnt %x prefetch_cnt %x prefetch_done %x refill_data %x\n", idx, superblockTag, blockId, subblkId, rf_addr, refill_cnt, prefetch_cnt, prefetch_done, out_r.data)
         when (refill_done) {
+          bothHotOrNoneHot(refill_done, out_r.last, "L4 refill error")
           when (ren) {
-            state := s_data_write
+            when (comp_en && !prefetch_done) {
+              state := s_wait_ram_arready
+            } .elsewhen (comp_en && prefetch_done) {
+              data_buf := comp_data_buf
+              state := s_data_write
+              prefetch_cnt := 0.U
+            } .otherwise {
+              state := s_data_write
+              prefetch_cnt := 0.U
+            }
           } .otherwise {
+            prefetch_cnt := 0.U // restore prefetch states
             state := s_merge_put_data
           }
         }
-        log("data_refill: idx %d superblockTag %x blockId %x subblkId %x mem_addr %x cnt %x refill_data %x\n", idx, superblockTag, blockId, subblkId, mem_addr, refill_cnt, out_r.data)
-        bothHotOrNoneHot(refill_done, out_r.last, "L4 refill error")
       }
 
       // read address channel signals
       out_ar.id := 0.U(outerIdWidth.W)
-      out_ar.addr := mem_addr
+      out_ar.addr := rf_addr
       out_ar.len := (outerSubblkBeats - 1).U(8.W)
       out_ar.size := axi4_size
       out_ar.burst := "b01".U // normal sequential memory
