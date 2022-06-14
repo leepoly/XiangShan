@@ -44,8 +44,8 @@ class ZeroLeadingCompressor(outerSubblkBeats: Int, outerBeatSize: Int, intraSlot
   val data_or = RegInit(false.B)
   val first_line_data = Reg(Vec(outerSubblkBeats, UInt(outerBeatSize.W)))
   when (io.line_ready) {
-    data_or := data_or | data_beat_or.orR | true.B // TODO: always no compress
-    // data_or := data_or | data_beat_or.orR
+    // data_or := true.B // TODO: always no compress
+    data_or := data_or | data_beat_or.orR
     when (!(data_or | data_beat_or.orR)) {
       comp_cnt := comp_cnt + 1.U
     }
@@ -53,14 +53,16 @@ class ZeroLeadingCompressor(outerSubblkBeats: Int, outerBeatSize: Int, intraSlot
       // first_line_data := input_data
       (0 until outerSubblkBeats).map((w: Int) => first_line_data(w) := input_data(w))
     }
-    printf("[Compressor] first_line %x data_beat_or %x data_or %x comp_cnt %x\n", io.first_line, data_beat_or.asUInt, data_or, comp_cnt)
+    when (RegNext(comp_cnt) > 1.U) {
+      printf("[Compressor] first_line %x data_beat_or %x data_or %x comp_cnt %x\n", io.first_line, data_beat_or.asUInt, data_or | data_beat_or.orR, RegNext(comp_cnt))
+    }
     when (io.last_line) {
       comp_cnt := 1.U
       data_or := false.B
     }
-    (0 until outerSubblkBeats).map((w: Int) => {
-    printf("[Compressor] comp_data cnt %x input_data %x first_line_data %x\n", w.U, input_data(w), first_line_data(w))
-    })
+    // (0 until outerSubblkBeats).map((w: Int) => {
+    // printf("[Compressor] comp_data cnt %x input_data %x first_line_data %x\n", w.U, input_data(w), first_line_data(w))
+    // })
   }
   io.comp_len := comp_cnt
   io.comp_data := first_line_data // if compressible, output first_line_data (all zero), otherwise output first_line_data
@@ -89,12 +91,13 @@ class ZeroLeadingDecompressor(outerSubblkBeats: Int, outerBeatSize: Int, intraSl
 // 5. [Done] Add per-block dirty information.
 // 6. [Done] Level-2 style sub-blocking
 // 7. [Done] Level-3 Per-superblock tag and sub-blocking
-// 8. [Dev] Zero-leading compression (compress when superblock miss)
+// 8. [Done] Zero-leading compression (compress when superblock miss)
 // 9. Compress when sub-block miss, read/write hit, etc.
 // 9. FPC/BDI compression
 // 10. Baryon's succient metadata format
 // 11. Software: Linux with arbitrary programs, Linux with stdin, etc.
 // 12. Emulate L4 cache latency and bandwidth
+// 13. (bug) cycle 2920381 comp_slotLen==0
 
 class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 {
@@ -118,7 +121,7 @@ class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 
       val Y = true.B
       val N = false.B
-      val debug = true // TODO: disable debug
+      val debug = false // TODO: disable debug
 
       val subblockSizeBits = subblockSize * 8
       val subblockBytes = subblockSize
