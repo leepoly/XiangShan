@@ -92,12 +92,20 @@ class ZeroLeadingDecompressor(outerSubblkBeats: Int, outerBeatSize: Int, intraSl
 // 6. [Done] Level-2 style sub-blocking
 // 7. [Done] Level-3 Per-superblock tag and sub-blocking
 // 8. [Done] Zero-leading compression (compress when superblock miss)
-// 9. Compress when sub-block miss, read/write hit, etc.
-// 9. FPC/BDI compression
-// 10. Baryon's succient metadata format
-// 11. Software: Linux with arbitrary programs, Linux with stdin, etc.
-// 12. Emulate L4 cache latency and bandwidth
-// 13. (bug) cycle 2920381 comp_slotLen==0
+
+// Yage
+// 1. Xiangshan environment setup (Docker, https://xiangshan-doc.readthedocs.io/zh_CN/latest/tools/xsenv/)
+// 2. Read both cache implementation (This one, and the original cache from https://github.com/tsinghua-ideal/hybridmem-fpga/commit/60452d0a9f6651bdb089312fcd90afb845b1826d)
+// 3. Low hit rate investigation (larger capacity? enable all subblock slots and all associativities? larger block size?)
+// 4. More stat counters, e.g., average_compSlotLen (indicate the amount of saving space), num_hitFromSubblocking
+// 5. More software: coremark, microbench, etc. [Optional] Try linux with arbitrary programs, Linux with stdin, etc. (Ref: https://github.dev/OpenXiangShan/riscv-linux)
+// 6. Show verilog and additional synthesizing cost in vivado
+// 7. At least one of the FPC/BDI compression (Frequent Pattern Compression: https://minds.wisconsin.edu/handle/1793/60388, Base-Delta-Immediate Compression: https://users.ece.cmu.edu/~omutlu/pub/bdi-compression_pact12.pdf)
+// 8. At least one replacement policy: FIFO/CLOCK is fine
+// 9. Insert more blank cycles to emulate fast memory latency (Ref)
+// 10. More powerful compression: compress when sub-block miss, read/write hit, etc.
+//      (bug) cycle 2920381 comp_slotLen==0
+// 11. [Optional] Baryon's succient metadata format
 
 class AXI4SimpleL4Cache()(implicit p: Parameters) extends LazyModule
 {
